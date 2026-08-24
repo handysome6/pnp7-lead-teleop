@@ -24,7 +24,7 @@ import time
 
 from dynamixel_sdk import PortHandler, PacketHandler
 
-from pnp7_lead import ALL_IDS
+from pnp7.lead import ALL_IDS
 
 ADDR_BAUD_RATE = 8
 ADDR_TORQUE_ENABLE = 64

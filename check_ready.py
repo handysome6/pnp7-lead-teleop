@@ -49,7 +49,7 @@ def tcp_open(host: str, port: int, timeout: float = 2.0) -> bool:
 
 def check_lead(rep: Report, port: str, baud: int) -> None:
     try:
-        from pnp7_lead import ALL_IDS, PNP7Lead
+        from pnp7.lead import ALL_IDS, PNP7Lead
     except ImportError as exc:
         rep.add(FAIL, "lead arm driver import", str(exc))
         return
@@ -287,7 +287,7 @@ def main() -> int:
     ap.add_argument("--deadman", default=None)
     ap.add_argument("--deadman-key", default=None,
                     help="key name or code the button emits (e.g. BTN_0, KEY_V)")
-    ap.add_argument("--config", default="pnp7_teleop.conf",
+    ap.add_argument("--config", default="conf/pnp7_teleop.conf",
                     help="teleop config to take deadman_device/deadman_key "
                          "from, so this check and the bridge cannot disagree")
     ap.add_argument("--skip-cameras", action="store_true")

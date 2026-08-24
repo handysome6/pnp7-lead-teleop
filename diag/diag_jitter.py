@@ -46,7 +46,7 @@ def lead_noise(seconds: float) -> int:
     """
     import time
 
-    from pnp7_lead import ALL_IDS, PNP7Lead
+    from pnp7.lead import ALL_IDS, PNP7Lead
 
     lead = PNP7Lead()
     lead.open()
@@ -93,7 +93,7 @@ def lead_noise(seconds: float) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("csv", nargs="?", default="")
-    ap.add_argument("--conf", default="demo.conf")
+    ap.add_argument("--conf", default="conf/demo.conf")
     ap.add_argument("--still-ticks", type=float, default=2.0,
                     help="lead motion below this (peak-to-peak ticks) over the "
                          "window counts as holding still")

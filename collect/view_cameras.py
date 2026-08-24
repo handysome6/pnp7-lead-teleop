@@ -196,7 +196,7 @@ def main() -> int:
         if key == ord("s"):
             saved += 1
             for s, pane in zip(streams, panes):
-                path = Path(__file__).parent / f"view_{s.role}_{saved:02d}.png"
+                path = Path(__file__).resolve().parents[1] / f"view_{s.role}_{saved:02d}.png"
                 cv2.imwrite(str(path), pane)
                 print(f"saved {path}")
         if args.seconds and time.monotonic() - t0 > args.seconds:

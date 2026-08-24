@@ -1,0 +1,24 @@
+# Present so `pnp7` is importable from the scripts, which now live in
+# subdirectories. Python puts the *script's* directory on sys.path, not the
+# repo root, so `from pnp7.lead import ...` fails without this -- and the
+# alternative is a sys.path shim pasted at the top of eight files.
+#
+#   uv pip install --python .venv/bin/python -e .
+#
+# Editable, so edits to pnp7/lead.py take effect without reinstalling. The
+# runtime dependencies stay in requirements.txt rather than being declared
+# here, because they are pinned for a commissioned robot rather than resolved
+# for a library.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pnp7"
+version = "0.1.0"
+description = "PNP-7 lead arm -> Franka teleoperation"
+requires-python = ">=3.11"
+
+[tool.setuptools]
+packages = ["pnp7"]

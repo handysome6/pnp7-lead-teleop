@@ -22,7 +22,7 @@ import argparse
 import sys
 import time
 
-from pnp7_lead import ALL_IDS, PNP7Lead
+from pnp7.lead import ALL_IDS, PNP7Lead
 
 WATCH = [5, 6]          # servo ids resting on the wrap boundary
 

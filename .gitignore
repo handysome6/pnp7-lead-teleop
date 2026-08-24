@@ -10,4 +10,23 @@ bin/
 __pycache__/
 *.pyc
 *.so
+*.egg-info/
 .DS_Store
+
+# Ad-hoc backups. Git already keeps the history these were standing in for --
+# they were made before this tree was under version control. Kept on disk on
+# the machines that have them, but not carried in the repo.
+*.bak
+*.bak-*
+*.bak_*
+*.bad_*
+conf-bak-*/
+
+# Screenshots and generated figures. Debugging leftovers and script output,
+# regenerable, and one of them is 2.1 MB.
+*.png
+
+# Run artefacts written next to the code by default.
+/dry.csv
+/run.csv
+*_run.csv

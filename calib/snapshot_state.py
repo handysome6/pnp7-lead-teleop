@@ -17,10 +17,11 @@ from pathlib import Path
 
 from dynamixel_sdk import PortHandler, PacketHandler
 
-from pnp7_lead import ALL_IDS
+from pnp7.lead import ALL_IDS
 
 ADDR_BAUD, ADDR_RETURN_DELAY, ADDR_TORQUE = 8, 9, 64
-CONFIGS = ["full100b.conf", "full50b.conf", "j6only.conf", "j7only.conf"]
+CONFIGS = ["conf/full100b.conf", "conf/full50b.conf",
+           "conf/j6only.conf", "conf/j7only.conf"]
 
 
 def servo_state(port_name, baud):
@@ -60,7 +61,9 @@ def main() -> int:
     ap.add_argument("--baud", type=int, default=1000000)
     args = ap.parse_args()
 
-    here = Path(__file__).parent
+    # The repo root, not this script's directory -- calibration.json, conf/
+    # and episodes/ all live one level up now.
+    here = Path(__file__).resolve().parents[1]
     out = here / args.out
     out.mkdir(parents=True, exist_ok=True)
 
@@ -70,7 +73,9 @@ def main() -> int:
     for name in ["calibration.json"] + CONFIGS:
         src = here / name
         if src.exists():
-            shutil.copy2(src, out / name)
+            # Flatten: a snapshot is a flat restorable set, so conf/x.conf
+            # lands as x.conf beside calibration.json.
+            shutil.copy2(src, out / Path(name).name)
 
     episodes = []
     ep_dir = here / "episodes"

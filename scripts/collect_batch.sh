@@ -8,6 +8,7 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
 ROOT="${1:?usage: collect_batch.sh <episodes-dir> [prefix]}"
 PREFIX="${2:-ep}"
 # COUNT  = how many MORE to record.
@@ -16,7 +17,7 @@ PREFIX="${2:-ep}"
 # already exist would collect five more, whereas TARGET=5 stops immediately.
 COUNT="${COUNT:-3}"
 TARGET="${TARGET:-0}"
-CONF="${CONF:-$HERE/full100b.conf}"
+CONF="${CONF:-$REPO/conf/full100b.conf}"
 DURATION="${DURATION:-60}"
 
 mkdir -p "$ROOT"
@@ -57,7 +58,7 @@ for i in $(seq 1 "$COUNT"); do
 
   echo
   echo "--- validating $name ---"
-  if "$HERE/.venv/bin/python" "$HERE/validate_episode.py" "$ROOT/$name"; then
+  if "$REPO/.venv/bin/python" "$REPO/collect/validate_episode.py" "$ROOT/$name"; then
     ok=$((ok + 1))
   else
     bad=$((bad + 1))

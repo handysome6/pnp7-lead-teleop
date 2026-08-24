@@ -14,7 +14,7 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONF="${CONF:-$HERE/demo.conf}"
+CONF="${CONF:-$HERE/conf/demo.conf}"
 DURATION="${DURATION:-300}"
 STATUS="${STATUS:-/tmp/pnp7_status.json}"
 export DISPLAY="${DISPLAY:-:0}"
@@ -44,12 +44,12 @@ fi
 
 echo
 echo "--- lead arm / robot correspondence ---"
-"$HERE/.venv/bin/python" "$HERE/check_correspondence.py" 2>&1 | tail -12 || true
+"$HERE/.venv/bin/python" "$HERE/calib/check_correspondence.py" 2>&1 | tail -12 || true
 
 echo
 echo "--- opening camera view on the robot screen ---"
 rm -f "$STATUS"
-setsid nohup "$HERE/.venv/bin/python" "$HERE/view_cameras.py" \
+setsid nohup "$HERE/.venv/bin/python" "$HERE/collect/view_cameras.py" \
   --status "$STATUS" >/tmp/demo_viewer.log 2>&1 </dev/null &
 
 for _ in $(seq 1 40); do
@@ -88,6 +88,6 @@ RC=$?
 echo
 echo "--- demo finished (exit $RC) ---"
 if [ -s /tmp/demo_run.csv ]; then
-  "$HERE/.venv/bin/python" "$HERE/analyze_run.py" /tmp/demo_run.csv \
+  "$HERE/.venv/bin/python" "$HERE/diag/analyze_run.py" /tmp/demo_run.csv \
     --conf "$CONF" 2>&1 | tail -22
 fi

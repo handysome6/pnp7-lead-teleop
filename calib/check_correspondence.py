@@ -25,7 +25,7 @@ import sys
 import tempfile
 import csv as csvmod
 
-from pnp7_lead import ALL_IDS, PNP7Lead, TICKS_TO_RAD, wrap_delta
+from pnp7.lead import ALL_IDS, PNP7Lead, TICKS_TO_RAD, wrap_delta
 
 NJ = 7
 

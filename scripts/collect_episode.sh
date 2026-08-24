@@ -7,7 +7,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONF="${CONF:-$HERE/full50.conf}"
+REPO="$(cd "$HERE/.." && pwd)"
+CONF="${CONF:-$REPO/conf/full50.conf}"
 DURATION="${DURATION:-60}"
 # MODE=dry exercises the whole pipeline without commanding the robot.
 MODE="${MODE:-robot}"
@@ -24,7 +25,7 @@ OUT="${1:?usage: collect_episode.sh <episode-dir> }"
 
 mkdir -p "$OUT"
 cp "$CONF" "$OUT/config.conf"
-cp "$HERE/calibration.json" "$OUT/calibration.json" 2>/dev/null || true
+cp "$REPO/calibration.json" "$OUT/calibration.json" 2>/dev/null || true
 
 # Correspondence pre-flight. Relative mapping only transports deltas, so the
 # lead arm can drift into a different configuration from the robot while
@@ -32,8 +33,8 @@ cp "$HERE/calibration.json" "$OUT/calibration.json" 2>/dev/null || true
 # look mirrored, and demonstrations recorded that way are awkward to reproduce.
 # Warn, do not block: a deliberately odd lead posture is sometimes wanted.
 echo "=== correspondence check ==="
-"$HERE/.venv/bin/python" "$HERE/check_correspondence.py" \
-  --calibration "$HERE/calibration.json" 2>&1 | tail -12 || true
+"$REPO/.venv/bin/python" "$REPO/calib/check_correspondence.py" \
+  --calibration "$REPO/calibration.json" 2>&1 | tail -12 || true
 echo
 
 echo "=== starting cameras ==="
@@ -43,7 +44,7 @@ if [ "$PREVIEW" = "1" ]; then
   export DISPLAY="${DISPLAY:-:0}"
   export XAUTHORITY="${XAUTHORITY:-/run/user/1000/gdm/Xauthority}"
 fi
-"$HERE/.venv/bin/python" "$HERE/record_cameras.py" \
+"$REPO/.venv/bin/python" "$REPO/collect/record_cameras.py" \
   --out "$OUT" --duration "$((DURATION + 6))" $PREVIEW_FLAG \
   > "$OUT/cameras.log" 2>&1 &
 CAM_PID=$!
@@ -84,7 +85,7 @@ fi
 echo "=== starting teleop bridge ($MODE) ==="
 # Not fatal on its own: a Ctrl-C is a legitimate way to end a take, and the
 # cameras still need to be reaped. The real test is whether a usable log landed.
-"$HERE/bin/pnp7_teleop" "$MODE" "$CONF" "$DURATION" "$OUT/teleop.csv"
+"$REPO/bin/pnp7_teleop" "$MODE" "$CONF" "$DURATION" "$OUT/teleop.csv"
 BRIDGE_RC=$?
 
 echo "=== waiting for cameras to finish ==="
@@ -124,4 +125,4 @@ if [ "$ROWS" -lt 1000 ]; then
 fi
 
 echo "=== building episode ==="
-"$HERE/.venv/bin/python" "$HERE/build_episode.py" --episode "$OUT"
+"$REPO/.venv/bin/python" "$REPO/collect/build_episode.py" --episode "$OUT"

@@ -22,7 +22,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from pnp7_lead import ALL_IDS, ARM_IDS, GRIPPER_ID, PNP7Lead
+from pnp7.lead import ALL_IDS, ARM_IDS, GRIPPER_ID, PNP7Lead
 
 # What the operator is told to do for each Franka joint. Kept deliberately
 # physical rather than referring to DH conventions.

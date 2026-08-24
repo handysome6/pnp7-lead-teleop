@@ -34,7 +34,7 @@ def load_conf(path):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
-    ap.add_argument("--conf", default="pnp7_teleop.conf")
+    ap.add_argument("--conf", default="conf/pnp7_teleop.conf")
     args = ap.parse_args()
 
     conf = load_conf(args.conf)

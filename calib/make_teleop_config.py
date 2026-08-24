@@ -55,7 +55,7 @@ def find_deadman() -> str | None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--calibration", default="calibration.json")
-    ap.add_argument("-o", "--out", default="pnp7_teleop.conf")
+    ap.add_argument("-o", "--out", default="conf/pnp7_teleop.conf")
     ap.add_argument("--enable", nargs="+", default=["J7"],
                     help="joints to drive; the rest are held (default: J7)")
     ap.add_argument("--scale", type=float, default=0.25,

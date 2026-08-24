@@ -32,7 +32,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 
-from pnp7_lead import ALL_IDS, PNP7Lead, wrap_delta
+from pnp7.lead import ALL_IDS, PNP7Lead, wrap_delta
 
 JOINTS = ["J1", "J2", "J3", "J4", "J5", "J6", "J7"]
 

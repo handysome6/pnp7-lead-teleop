@@ -16,7 +16,7 @@ import signal
 import sys
 import time
 
-from pnp7_lead import ARM_IDS, GRIPPER_ID, PNP7Lead
+from pnp7.lead import ARM_IDS, GRIPPER_ID, PNP7Lead
 
 BAR_WIDTH = 21
 

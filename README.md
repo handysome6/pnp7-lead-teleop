@@ -39,8 +39,8 @@ velocity, zero failed frames over 1500 reads.
 To revert:
 
 ```bash
-python tune_bus.py --raw 250 --yes
-python set_baud.py --from-baud 1000000 --to 57600 --yes
+python diag/tune_bus.py --raw 250 --yes
+python diag/set_baud.py --from-baud 1000000 --to 57600 --yes
 ```
 
 A udev rule (`/etc/udev/rules.d/99-pnp7-lead.rules`) pins the adapter to
@@ -151,9 +151,11 @@ git clone https://github.com/ROBOTIS-GIT/DynamixelSDK.git
 git -C DynamixelSDK checkout 2ded684              # what this was commissioned on
 make -C DynamixelSDK/c++/build/linux64            # -> libdxl_x64_cpp.so
 
-# 2. Python environment for the tooling.
+# 2. Python environment for the tooling. The editable install is what makes
+#    `from pnp7.lead import ...` work from scripts in subdirectories.
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
+uv pip install --python .venv/bin/python -e .
 
 # 3. The bridge.
 ./build.sh
@@ -167,9 +169,9 @@ strictly more hardware than the one above it, so the first failure tells you
 which layer is wrong:
 
 ```bash
-./bin/pnp7_teleop selftest demo.conf     # offline; expect SELFTEST_OK, 11 checks
-.venv/bin/python check_ready.py --config demo.conf
-./bin/pnp7_teleop dry demo.conf 10 /tmp/dry.csv   # expect ~940 Hz, 0 read failures
+./bin/pnp7_teleop selftest conf/demo.conf     # offline; expect SELFTEST_OK, 11 checks
+.venv/bin/python check_ready.py --config conf/demo.conf
+./bin/pnp7_teleop dry conf/demo.conf 10 /tmp/dry.csv   # expect ~940 Hz, 0 read failures
 ```
 
 `check_ready.py` needs the venv's interpreter specifically, and the failure mode
@@ -208,7 +210,7 @@ with the repo name for a deploy key, or a username for an account key.
 
 ## Teleoperation bridge
 
-`pnp7_teleop.cpp` implements roadmap V1. Two threads, per roadmap section 12:
+`src/pnp7_teleop.cpp` implements roadmap V1. Two threads, per roadmap section 12:
 the lead arm is sampled on its own thread and published as an atomic snapshot;
 the 1 kHz FCI callback only reads that snapshot, runs the safety chain, and
 returns. No USB traffic, allocation, or logging I/O happens inside the callback.
@@ -256,9 +258,9 @@ conservative than them.
 
 ```bash
 ./build.sh
-./bin/pnp7_teleop selftest pnp7_teleop.conf          # offline, 10 checks
-./bin/pnp7_teleop dry      pnp7_teleop.conf 30 dry.csv   # hardware, no robot
-./bin/pnp7_teleop robot    pnp7_teleop.conf 60 run.csv   # live
+./bin/pnp7_teleop selftest conf/pnp7_teleop.conf          # offline, 10 checks
+./bin/pnp7_teleop dry      conf/pnp7_teleop.conf 30 dry.csv   # hardware, no robot
+./bin/pnp7_teleop robot    conf/pnp7_teleop.conf 60 run.csv   # live
 ```
 
 `dry` runs the entire pipeline - lead arm, dead-man, clutch, safety chain -
@@ -268,7 +270,7 @@ the robot untouched. Always run it before `robot`.
 ## Data collection
 
 ```bash
-DURATION=60 CONF=full50g.conf ./collect_episode.sh episodes/ep001
+DURATION=60 CONF=conf/full50g.conf scripts/collect_episode.sh episodes/ep001
 ```
 
 Starts both cameras, waits for `CAMERAS_READY` (auto-exposure needs to settle
@@ -307,7 +309,7 @@ dead-man was released are dropped too - they are not demonstration.
 ### Validating an episode
 
 ```bash
-.venv/bin/python validate_episode.py episodes/ep001
+.venv/bin/python collect/validate_episode.py episodes/ep001
 ```
 
 Checks the failure modes a summary line hides: missing or zero-byte frames,
@@ -329,42 +331,77 @@ training action is `q_command`, never the raw master encoder. The delta form
 `a_t = q_command(t+1) - q_robot(t)` from section 14 is derived alongside it as
 `dq_action*`.
 
+## Layout
+
+Everything used to sit in the root directory, which made it impossible to tell
+the three scripts you run every day from the twenty that were written once to
+identify a servo bus. Grouped by what a file is *for*:
+
+```
+build.sh  demo.sh  check_ready.py        the three entry points
+calibration.json                         live calibration, read by most tools
+conf/                                    12 teleop configs
+src/pnp7_teleop.cpp                      the realtime bridge
+pnp7/lead.py                             lead-arm driver (the only shared module)
+scripts/                                 collect_episode.sh, collect_batch.sh
+calib/                                   calibration, config generation, drift checks
+collect/                                 recording, episode building, validation, viewer
+diag/                                    diagnostics, benchmarks, bus tuning, bring-up probes
+deadman/                                 button identification and the udev rule
+event_camera/                            EVK4 tooling (separate subsystem)
+known_good/                              restorable snapshot, written by calib/snapshot_state.py
+archive/                                 superseded configs and one-off patch scripts
+```
+
+`pnp7/` is a real package installed editable into the venv, so `from pnp7.lead
+import ...` resolves no matter which subdirectory a script lives in. Python puts
+the *script's* directory on `sys.path`, never the repo root, so without the
+install the eight importers would each need a `sys.path` shim.
+
+Most scripts resolve `calibration.json` and `conf/*.conf` relative to the
+current directory, so **run them from the repo root**, as every example here
+does.
+
 ## Tools
 
 | Script | Purpose | Touches robot? |
 |---|---|---|
 | `check_ready.py` | Pre-flight gate check across lead arm, Franka, cameras | read-only |
-| `monitor.py` | Live 8-servo read-out with per-joint travel ranges | read-only |
-| `calibrate.py` | Guided joint-index / direction / range calibration | read-only |
-| `bench_read.py` | Sustained SyncRead rate benchmark | read-only |
-| `dump_state.py` | Full servo register inventory | read-only |
-| `set_baud.py` | Change bus baud (writes EEPROM addr 8) | servos only |
-| `tune_bus.py` | Change return delay (writes EEPROM addr 9) | servos only |
-| `pnp7_lead.py` | Driver module used by the above | read-only |
-| `verify_wrap.py` | Confirms signed decode near the encoder boundary | read-only |
-| `make_teleop_config.py` | calibration.json -> pnp7_teleop.conf | none |
-| `pnp7_teleop.cpp` | The teleop bridge itself | commands the arm |
-| `mark_verified.py` | Records a confirmed joint direction | none |
-| `analyze_run.py` | Validates a run against its configured limits | none |
-| `record_cameras.py` | Dual RealSense recorder | none |
-| `build_episode.py` | Joins teleop log + cameras into an episode | none |
-| `collect_episode.sh` | Runs a whole episode end to end | commands the arm |
-| `diag_gripper.py` | Measures real hand reaction latency from a log | none |
-| `diag_jitter.py` | Command dither while holding still; `--lead-only` reads the encoders directly | read-only |
-| `validate_episode.py` | Checks a collected episode is fit to train on | none |
-| `check_correspondence.py` | Lead-vs-robot configuration drift | read-only |
-| `rebase_calibration.py` | Move a verified calibration to a new posture | read-only |
-| `prune_episode.py` | Reclaim space from a validated episode | none |
-| `snapshot_state.py` | Capture the verified state as known-good | read-only |
-| `view_cameras.py` | Show both RGB streams on the robot PC screen | none |
-| `demo.sh` | Live teleop demonstration with cameras on screen | commands the arm |
-
+| `demo.sh` | Live demonstration, cameras plus teleop | commands the arm |
+| `scripts/collect_episode.sh` | Runs a whole episode end to end | commands the arm |
+| `scripts/collect_batch.sh` | Several episodes in one sitting, validating each | commands the arm |
+| `src/pnp7_teleop.cpp` | The teleop bridge itself | commands the arm |
+| `pnp7/lead.py` | Driver module used by everything below | read-only |
+| `calib/calibrate.py` | Guided joint-index / direction / range calibration | read-only |
+| `calib/make_teleop_config.py` | calibration.json -> conf/pnp7_teleop.conf | none |
+| `calib/check_correspondence.py` | Lead-vs-robot configuration drift | read-only |
+| `calib/rebase_calibration.py` | Move a verified calibration to a new posture | read-only |
+| `calib/mark_verified.py` | Records a confirmed joint direction | none |
+| `calib/verify_wrap.py` | Confirms signed decode near the encoder boundary | read-only |
+| `calib/snapshot_state.py` | Capture the verified state as known-good | read-only |
+| `collect/record_cameras.py` | Dual RealSense recorder | none |
+| `collect/build_episode.py` | Joins teleop log + cameras into an episode | none |
+| `collect/validate_episode.py` | Checks a collected episode is fit to train on | none |
+| `collect/prune_episode.py` | Reclaim space from a validated episode | none |
+| `collect/view_cameras.py` | Both RealSense streams on the robot screen | none |
+| `diag/analyze_run.py` | Validates a run against its configured limits | none |
+| `diag/monitor.py` | Live 8-servo read-out with per-joint travel ranges | read-only |
+| `diag/diag_gripper.py` | Measures real hand reaction latency from a log | none |
+| `diag/diag_jitter.py` | Command dither while holding still; `--lead-only` reads the encoders directly | read-only |
+| `diag/diag_pose.py` | Lead vs Franka joint configurations across a run | none |
+| `diag/dump_state.py` | Full servo register inventory | read-only |
+| `diag/bench_read.py` | Sustained SyncRead rate benchmark | read-only |
+| `diag/set_baud.py` | Change bus baud (writes EEPROM addr 8) | servos only |
+| `diag/tune_bus.py` | Change return delay (writes EEPROM addr 9) | servos only |
+| `diag/probe_ping.py`, `diag/probe_listen.py` | Bring-up probes that identified the bus | read-only |
+| `deadman/find_button.py` | Finds an unknown button's event node and key code | none |
+| `deadman/grab_button.py` | Takes the button exclusively, standalone | none |
 ## Usage
 
 ```bash
 cd ~/workspace/andyls/pnp7-lead-teleop
 .venv/bin/python check_ready.py        # all gates must read PASS
-.venv/bin/python calibrate.py --out calibration.json
+.venv/bin/python calib/calibrate.py --out calibration.json
 ```
 
 ## Franka pre-conditions
@@ -539,7 +576,7 @@ If the lead arm's comfortable configuration differs from the one calibration
 was done in, rebase rather than recalibrate:
 
 ```bash
-python rebase_calibration.py --set-sign J6=+1 --unverify J7 --label "J5+180"
+python calib/rebase_calibration.py --set-sign J6=+1 --unverify J7 --label "J5+180"
 ```
 
 The servo-to-joint mapping is physical wiring and does not depend on posture, so
@@ -560,7 +597,7 @@ joints and label, and records every rebase in `posture_history`.
 ## Known-good state
 
 ```bash
-python snapshot_state.py --label "ready-for-vla-collection"
+python calib/snapshot_state.py --label "ready-for-vla-collection"
 ```
 
 Writes `known_good/` with the calibration, the working configs, and a
@@ -606,7 +643,7 @@ and the realtime loop is untouched.
 
 ```bash
 DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority \
-  .venv/bin/python view_cameras.py
+  .venv/bin/python collect/view_cameras.py
 ```
 
 Must run on the machine's own display. Opens the same devices, resolution and

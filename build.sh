@@ -14,7 +14,7 @@ g++ -O2 -std=c++17 -Wall -Wextra -pthread \
   -I/usr/include/eigen3 \
   -I"$DXL/include/dynamixel_sdk" \
   -I"$DXL/include" \
-  "$HERE/pnp7_teleop.cpp" \
+  "$HERE/src/pnp7_teleop.cpp" \
   -o "$HERE/bin/pnp7_teleop" \
   -L"$LIBFRANKA/build" -lfranka \
   -L"$DXL/build/linux64" -ldxl_x64_cpp \
