@@ -1,0 +1,13 @@
+# Recorded episodes, 2.3 GB on the control PC. Data lives there, not here.
+episodes/
+
+# Vendored upstream SDK, 43 MB. Cloned separately; see README.
+DynamixelSDK/
+
+# Build products and environments.
+bin/
+.venv/
+__pycache__/
+*.pyc
+*.so
+.DS_Store

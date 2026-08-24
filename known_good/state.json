@@ -1,0 +1,153 @@
+{
+  "label": "ready-for-vla-collection",
+  "captured": "2026-08-20T10:47:49.971832+00:00",
+  "git_rev": null,
+  "lead_arm": {
+    "port": "/dev/pnp7_lead",
+    "baud": 1000000,
+    "servos": {
+      "1": {
+        "baud_code": 3,
+        "return_delay": 0,
+        "torque_enable": 0
+      },
+      "2": {
+        "baud_code": 3,
+        "return_delay": 0,
+        "torque_enable": 0
+      },
+      "3": {
+        "baud_code": 3,
+        "return_delay": 0,
+        "torque_enable": 0
+      },
+      "4": {
+        "baud_code": 3,
+        "return_delay": 0,
+        "torque_enable": 0
+      },
+      "5": {
+        "baud_code": 3,
+        "return_delay": 0,
+        "torque_enable": 0
+      },
+      "6": {
+        "baud_code": 3,
+        "return_delay": 0,
+        "torque_enable": 0
+      },
+      "7": {
+        "baud_code": 3,
+        "return_delay": 0,
+        "torque_enable": 0
+      },
+      "8": {
+        "baud_code": 3,
+        "return_delay": 0,
+        "torque_enable": 0
+      }
+    },
+    "note": "baud code 3 = 1 Mbps, return_delay 0, torque_enable 0 on all eight. Factory values were code 1 and 250."
+  },
+  "calibration": {
+    "signs_verified": true,
+    "joints": {
+      "J1": {
+        "servo": 1,
+        "sign": 1,
+        "verified": "2026-08-20T04:29:00.706823+00:00"
+      },
+      "J2": {
+        "servo": 2,
+        "sign": -1,
+        "verified": "2026-08-20T04:29:00.723623+00:00"
+      },
+      "J3": {
+        "servo": 3,
+        "sign": 1,
+        "verified": "2026-08-20T04:31:52.259290+00:00"
+      },
+      "J4": {
+        "servo": 4,
+        "sign": -1,
+        "verified": "2026-08-20T04:31:52.259290+00:00"
+      },
+      "J5": {
+        "servo": 5,
+        "sign": 1,
+        "verified": "2026-08-20T04:24:29.148383+00:00"
+      },
+      "J6": {
+        "servo": 6,
+        "sign": 1,
+        "verified": "2026-08-20T09:03:44.779581+00:00"
+      },
+      "J7": {
+        "servo": 7,
+        "sign": 1,
+        "verified": "2026-08-20T09:02:49.106054+00:00"
+      }
+    },
+    "posture_history": [
+      {
+        "rebased": "2026-08-20T09:00:32.087219+00:00",
+        "label": "J5+180",
+        "flipped": [
+          "J6"
+        ],
+        "unverified": [
+          "J7"
+        ],
+        "neutral_ticks": [
+          1043,
+          1688,
+          2058,
+          3139,
+          6239,
+          -835,
+          1965,
+          1364
+        ]
+      },
+      {
+        "rebased": "2026-08-20T09:00:51.321304+00:00",
+        "label": "J5+180",
+        "flipped": [
+          "J6"
+        ],
+        "unverified": [
+          "J7"
+        ],
+        "neutral_ticks": [
+          1013,
+          1946,
+          2002,
+          3194,
+          6177,
+          -1064,
+          1968,
+          1361
+        ]
+      }
+    ]
+  },
+  "cameras": [
+    {
+      "serial": "233622071437",
+      "name": "RealSense D435I",
+      "firmware": "5.17.0.10"
+    },
+    {
+      "serial": "213622078826",
+      "name": "RealSense D435I",
+      "firmware": "5.14.0"
+    }
+  ],
+  "configs": [
+    "full100b.conf",
+    "full50b.conf",
+    "j6only.conf",
+    "j7only.conf"
+  ],
+  "accepted_episodes": []
+}

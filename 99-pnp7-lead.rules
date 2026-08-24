@@ -1,0 +1,65 @@
+# PNP-7 rig: stable device names, independent of USB port and probe order.
+#
+# Both devices were moved to a hub at one point, which renumbered them. The
+# lead arm survived because it is matched by serial; the dead-man did not,
+# because its config held a bare /dev/input/eventN path. Both are pinned here.
+
+# --- lead arm: FT232H -> Dynamixel XL330 bus ---
+# /dev/ttyUSB* is assigned in probe order, so it moves if any other USB serial
+# device enumerates first. The ftdi_sio default latency_timer of 16 ms also
+# dominates the read cycle; 1 ms is required to sustain 400+ Hz SyncRead.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", ATTRS{serial}=="FTAKC4NZ", SYMLINK+="pnp7_lead", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTRS{serial}=="FTAKC4NZ", ATTR{latency_timer}="1"
+
+# --- dead-man: nameless HID button, 0483:5750, emits KEY_F3 ---
+# Replaced the SpaceMouse. This device publishes no manufacturer, product or
+# serial string, so there is nothing to match on but VID:PID plus the interface
+# number. It exports two input nodes: interface 01 is the keyboard node that
+# carries the button, interface 02 is a mouse node nothing here uses.
+#
+# Matched on ENV rather than ATTRS. Every ATTRS key in one rule has to match on
+# the same parent device, and idVendor/idProduct live on the USB device while
+# bInterfaceNumber lives on the interface below it -- so the ATTRS form of this
+# rule silently matches nothing. The ID_* properties are all set on the event
+# device itself by the usb_id/input_id builtins in 60-persistent-input.rules,
+# which run before this file.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_VENDOR_ID}=="0483", ENV{ID_MODEL_ID}=="5750", ENV{ID_USB_INTERFACE_NUM}=="01", SYMLINK+="pnp7_deadman", MODE="0660", GROUP="input"
+
+# Keep the desktop off the button. KEY_F3 is an ordinary keystroke that some
+# application holds a global binding for, so every press raised a window over
+# the running session. Teleop's EVIOCGRAB only covers the time teleop is
+# actually running; this covers the rest. No ENV{ID_USB_INTERFACE_NUM} here on
+# purpose: both interfaces are marked, because either could reach the desktop.
+#
+# This is the whole mechanism, on X11 as well as Wayland. xf86-input-libinput
+# honours the property too -- it refuses to create the device, so the X server
+# drops it (verified: the button no longer appears in `xinput list`). The
+# xorg.conf.d "Ignore" option would be the more explicit X11 spelling, but
+# xorg.conf.d is only parsed when the X server starts, so it does nothing until
+# the next login, while this takes effect on the next replug.
+SUBSYSTEM=="input", ENV{ID_VENDOR_ID}=="0483", ENV{ID_MODEL_ID}=="5750", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+
+# --- dead-man button: vendor configuration channel (hidraw) ---
+# The switch ships in one-shot mode: however long it is physically held down it
+# emits a single ~32 ms KEY_F3 pulse, which cannot drive a hold-to-enable
+# dead-man. The vendor reprograms it from a WebHID page through the
+# vendor-defined collection on interface 00 (64-byte in and out reports).
+# Chrome cannot enumerate that while /dev/hidraw* is root-only -- the symptom
+# is a device chooser with nothing in it.
+#
+# Interface 00 only. Interfaces 01 and 02 are the keyboard and mouse
+# collections and a web page must never be able to read those.
+#
+# Two rules, for the same reason the symlink rule above uses ENV: every ATTRS
+# key in one rule has to match on the same parent device, and idVendor lives on
+# the USB device while bInterfaceNumber lives on the interface below it. The
+# first rule tags the whole device, the second narrows to one interface with a
+# single ATTRS key.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5750", ENV{PNP7_DEADMAN_HID}="1"
+SUBSYSTEM=="hidraw", ENV{PNP7_DEADMAN_HID}=="1", ATTRS{bInterfaceNumber}=="00", MODE="0660", GROUP="plugdev", SYMLINK+="pnp7_deadman_cfg"
+
+# --- dead-man, previous hardware: 3Dconnexion SpaceMouse Compact (BTN_0) ---
+# Kept so plugging the SpaceMouse back in still works. If both are attached at
+# once they fight over the symlink and whichever enumerates last wins, so do
+# not run with both plugged in.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="256f", ATTRS{idProduct}=="c635", SYMLINK+="pnp7_deadman", MODE="0660", GROUP="input"

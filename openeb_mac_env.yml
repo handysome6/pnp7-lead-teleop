@@ -1,0 +1,27 @@
+# OpenEB 在 macOS/arm64 上的编译环境。
+#
+# 用 conda-forge 而非 Homebrew：后者版本跨度太大（protobuf 35 / opencv 5 /
+# hdf5 2.2），而 OpenEB 官方只在 Ubuntu 22.04 验证过。
+#
+# 只固定 pybind11 —— OpenEB 明确要求 2.11.0，且没有预编译包。其余依赖在
+# CMake 里都只是最低版本约束（例如 find_package(HDF5 1.10.2)），把它们钉死
+# 反而会引发依赖螺旋：pin hdf5=1.10.6 会和其他包要的 >=1.14.3 打架，
+# pin libprotobuf=3.21 会和 opencv 4.9 要的 4.25 打架。
+#
+# python 3.11：py-opencv 在 osx-arm64 上有 3.8/3.9/3.11/3.12 构建，没有 3.10。
+name: openeb
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - cmake>=3.26
+  - ninja
+  - pkg-config
+  - boost-cpp
+  - libopencv
+  - py-opencv
+  - hdf5
+  - libusb
+  - pybind11=2.11.1
+  - numpy
+  - pip

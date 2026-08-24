@@ -1,0 +1,197 @@
+{
+  "created": "2026-08-20T08:54:24.418495+00:00",
+  "port": "/dev/pnp7_lead",
+  "baud": 1000000,
+  "neutral_ticks": [
+    1007,
+    1584,
+    2052,
+    3207,
+    6148,
+    -323,
+    2023,
+    1366
+  ],
+  "servo_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "arm_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "joint_map": [
+    {
+      "franka_joint": 0,
+      "label": "J1",
+      "lead_servo_id": 6,
+      "observed_sign": -1,
+      "travel_ticks": 372,
+      "travel_deg": 32.7,
+      "neutral_ticks": -323,
+      "status": "ambiguous",
+      "all_travel": {
+        "1": 363,
+        "2": 18,
+        "3": 117,
+        "4": 79,
+        "5": 42,
+        "6": 372,
+        "7": 8,
+        "8": 0
+      }
+    },
+    {
+      "franka_joint": 1,
+      "label": "J2",
+      "lead_servo_id": 2,
+      "observed_sign": 1,
+      "travel_ticks": 518,
+      "travel_deg": 45.53,
+      "neutral_ticks": 1584,
+      "status": "ok",
+      "all_travel": {
+        "1": 37,
+        "2": 518,
+        "3": 107,
+        "4": 94,
+        "5": 8,
+        "6": 90,
+        "7": 76,
+        "8": 0
+      }
+    },
+    {
+      "franka_joint": 2,
+      "label": "J3",
+      "lead_servo_id": 6,
+      "observed_sign": -1,
+      "travel_ticks": 584,
+      "travel_deg": 51.33,
+      "neutral_ticks": -323,
+      "status": "ambiguous",
+      "all_travel": {
+        "1": 115,
+        "2": 55,
+        "3": 578,
+        "4": 85,
+        "5": 49,
+        "6": 584,
+        "7": 10,
+        "8": 1
+      }
+    },
+    {
+      "franka_joint": 3,
+      "label": "J4",
+      "lead_servo_id": 4,
+      "observed_sign": -1,
+      "travel_ticks": 511,
+      "travel_deg": 44.91,
+      "neutral_ticks": 3207,
+      "status": "ambiguous",
+      "all_travel": {
+        "1": 86,
+        "2": 184,
+        "3": 9,
+        "4": 511,
+        "5": 36,
+        "6": 246,
+        "7": 121,
+        "8": 1
+      }
+    },
+    {
+      "franka_joint": 4,
+      "label": "J5",
+      "lead_servo_id": 5,
+      "observed_sign": 1,
+      "travel_ticks": 1099,
+      "travel_deg": 96.59,
+      "neutral_ticks": 6148,
+      "status": "ok",
+      "all_travel": {
+        "1": 17,
+        "2": 27,
+        "3": 64,
+        "4": 53,
+        "5": 1099,
+        "6": 22,
+        "7": 7,
+        "8": 2
+      }
+    },
+    {
+      "franka_joint": 5,
+      "label": "J6",
+      "lead_servo_id": 6,
+      "observed_sign": 1,
+      "travel_ticks": 999,
+      "travel_deg": 87.8,
+      "neutral_ticks": -323,
+      "status": "duplicate",
+      "all_travel": {
+        "1": 28,
+        "2": 52,
+        "3": 15,
+        "4": 14,
+        "5": 8,
+        "6": 999,
+        "7": 1,
+        "8": 1
+      }
+    },
+    {
+      "franka_joint": 6,
+      "label": "J7",
+      "lead_servo_id": 7,
+      "observed_sign": 1,
+      "travel_ticks": 1278,
+      "travel_deg": 112.32,
+      "neutral_ticks": 2023,
+      "status": "ok",
+      "all_travel": {
+        "1": 36,
+        "2": 86,
+        "3": 33,
+        "4": 38,
+        "5": 46,
+        "6": 35,
+        "7": 1278,
+        "8": 1
+      }
+    }
+  ],
+  "gripper": {
+    "lead_servo_id": 8,
+    "min_ticks": 655,
+    "max_ticks": 1359,
+    "neutral_ticks": 1366
+  },
+  "franka_rest_pose": {
+    "q": [
+      0.5017743948211616,
+      0.5330649010246994,
+      -0.37741779238201295,
+      -2.4886063472761366,
+      0.3191780292002301,
+      3.0175924874213096,
+      0.8020858014058809
+    ],
+    "robot_mode": 1,
+    "gripper_width": 0.08003518730401993
+  },
+  "signs_verified": false,
+  "note": "observed_sign is provisional; confirm in the supervised single-joint test before raising scale above 0.25"
+}

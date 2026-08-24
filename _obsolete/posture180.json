@@ -1,0 +1,24 @@
+{
+  "label": "posture180.json",
+  "captured": "2026-08-20T06:43:19.416246+00:00",
+  "lead_ticks": [
+    858,
+    1666,
+    2236,
+    3255,
+    5975,
+    -718,
+    2152,
+    1355
+  ],
+  "franka_q": [
+    0.425835528473093,
+    -0.11808628699686206,
+    -0.3989021251427395,
+    -2.506305756161488,
+    -0.14305179090455405,
+    2.7877169019365255,
+    0.9013580448838967
+  ],
+  "note": "Working posture. Drift is measured against this rather than the calibration pose. If the config carries a POSTURE OVERRIDE, it belongs with this file."
+}

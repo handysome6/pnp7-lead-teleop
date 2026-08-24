@@ -1,0 +1,204 @@
+{
+  "created": "2026-08-20T03:55:44.455028+00:00",
+  "port": "/dev/pnp7_lead",
+  "baud": 1000000,
+  "neutral_ticks": [
+    954,
+    1710,
+    2031,
+    3166,
+    3936,
+    182,
+    2289,
+    1353
+  ],
+  "servo_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "arm_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "joint_map": [
+    {
+      "franka_joint": 0,
+      "label": "J1",
+      "lead_servo_id": 1,
+      "observed_sign": 1,
+      "travel_ticks": 735,
+      "travel_deg": 64.6,
+      "neutral_ticks": 1227,
+      "status": "ok",
+      "all_travel": {
+        "1": 735,
+        "2": 9,
+        "3": 181,
+        "4": 5,
+        "5": 6,
+        "6": 1,
+        "7": 1,
+        "8": 0
+      },
+      "sign_verified": "2026-08-20T04:29:00.706823+00:00"
+    },
+    {
+      "franka_joint": 1,
+      "label": "J2",
+      "lead_servo_id": 2,
+      "observed_sign": -1,
+      "travel_ticks": 527,
+      "travel_deg": 46.32,
+      "neutral_ticks": 2131,
+      "status": "ok",
+      "all_travel": {
+        "1": 68,
+        "2": 527,
+        "3": 9,
+        "4": 21,
+        "5": 7,
+        "6": 11,
+        "7": 1,
+        "8": 0
+      },
+      "sign_verified": "2026-08-20T04:29:00.723623+00:00"
+    },
+    {
+      "franka_joint": 2,
+      "label": "J3",
+      "lead_servo_id": 3,
+      "observed_sign": 1,
+      "travel_ticks": 617,
+      "travel_deg": 54.23,
+      "neutral_ticks": 1836,
+      "status": "ok",
+      "all_travel": {
+        "1": 38,
+        "2": 32,
+        "3": 617,
+        "4": 66,
+        "5": 10,
+        "6": 1,
+        "7": 1,
+        "8": 0
+      },
+      "sign_verified": "2026-08-20T04:31:52.259290+00:00"
+    },
+    {
+      "franka_joint": 3,
+      "label": "J4",
+      "lead_servo_id": 4,
+      "observed_sign": -1,
+      "travel_ticks": 779,
+      "travel_deg": 68.47,
+      "neutral_ticks": 3291,
+      "status": "ok",
+      "all_travel": {
+        "1": 34,
+        "2": 139,
+        "3": 40,
+        "4": 779,
+        "5": 24,
+        "6": 142,
+        "7": 1,
+        "8": 0
+      },
+      "sign_verified": "2026-08-20T04:31:52.259290+00:00"
+    },
+    {
+      "franka_joint": 4,
+      "label": "J5",
+      "lead_servo_id": 5,
+      "observed_sign": 1,
+      "travel_ticks": 931,
+      "travel_deg": 81.83,
+      "neutral_ticks": 4063,
+      "status": "ok",
+      "all_travel": {
+        "1": 27,
+        "2": 28,
+        "3": 18,
+        "4": 23,
+        "5": 931,
+        "6": 4,
+        "7": 5,
+        "8": 1
+      },
+      "sign_verified": "2026-08-20T04:24:29.148383+00:00"
+    },
+    {
+      "franka_joint": 5,
+      "label": "J6",
+      "lead_servo_id": 6,
+      "observed_sign": -1,
+      "travel_ticks": 634,
+      "travel_deg": 55.72,
+      "neutral_ticks": 182,
+      "status": "ok",
+      "all_travel": {
+        "1": 8,
+        "2": 21,
+        "3": 18,
+        "4": 35,
+        "5": 23,
+        "6": 634,
+        "7": 4,
+        "8": 1
+      },
+      "sign_verified": "2026-08-20T04:24:29.148383+00:00"
+    },
+    {
+      "franka_joint": 6,
+      "label": "J7",
+      "lead_servo_id": 7,
+      "observed_sign": 1,
+      "travel_ticks": 715,
+      "travel_deg": 62.84,
+      "neutral_ticks": 2082,
+      "status": "ok",
+      "all_travel": {
+        "1": 61,
+        "2": 28,
+        "3": 10,
+        "4": 4,
+        "5": 54,
+        "6": 79,
+        "7": 715,
+        "8": 0
+      },
+      "sign_verified": "2026-08-20T04:20:58.659024+00:00"
+    }
+  ],
+  "gripper": {
+    "lead_servo_id": 8,
+    "min_ticks": 649,
+    "max_ticks": 1355,
+    "neutral_ticks": 1360
+  },
+  "franka_rest_pose": {
+    "q": [
+      0.35758306967083436,
+      0.15105449102115961,
+      -0.2924318678469428,
+      -2.5588699154611385,
+      0.04008896735269248,
+      2.719103665753806,
+      0.7752260401332184
+    ],
+    "robot_mode": 1,
+    "gripper_width": 0.08002731204032898
+  },
+  "signs_verified": true,
+  "note": "observed_sign is provisional; confirm in the supervised single-joint test before raising scale above 0.25"
+}
