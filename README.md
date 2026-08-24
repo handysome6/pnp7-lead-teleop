@@ -180,6 +180,32 @@ named 'serial'` row and then simply omits the torque and sample-rate gates. The
 result is an `overall: FAIL` that reads like an ordinary hardware fault while
 two of the four lead-arm checks never ran at all.
 
+### Syncing the two checkouts
+
+There are two working copies -- `~/workspace/vla_data_collect/pnp7-lead-teleop`
+on the laptop and `~/workspace/andyls/pnp7-lead-teleop` on the robot PC -- both
+tracking `github.com/handysome6/pnp7-lead-teleop`. They reach it over different
+protocols, for reasons that are not obvious from `git remote -v`:
+
+- **Laptop: HTTPS.** Tailscale resolves `github.com` to `198.18.0.47` and closes
+  port 22, so the `git@github.com:` form cannot connect. HTTPS works, using the
+  `gh` credential helper. If `github.com` is ever taken back out of Tailscale's
+  interception, the remote can be switched to SSH.
+- **Robot PC: SSH through a `github-pnp7` host alias.** This machine's default
+  keys belong to a different GitHub account (`git-xuxin`) which has no write
+  access here, and GitHub decides the identity from whichever key authenticates
+  first. The alias in `~/.ssh/config` pins a write-enabled deploy key with
+  `IdentitiesOnly yes`; that option is load-bearing, not decoration. Drop it and
+  ssh offers the default key first, authenticates as `git-xuxin`, and the push
+  is refused.
+
+The robot PC also carries a repo-local `user.name` / `user.email`, because its
+global git identity belongs to another user of the same account. Without it,
+commits made at the robot are attributed to that person.
+
+Check which identity a push will use with `ssh -T git@github-pnp7` -- it answers
+with the repo name for a deploy key, or a username for an account key.
+
 ## Teleoperation bridge
 
 `pnp7_teleop.cpp` implements roadmap V1. Two threads, per roadmap section 12:
