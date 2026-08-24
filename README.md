@@ -362,6 +362,14 @@ Most scripts resolve `calibration.json` and `conf/*.conf` relative to the
 current directory, so **run them from the repo root**, as every example here
 does.
 
+One exception worth knowing about: `event_camera/` is the source of truth, but
+not what actually runs. The EVK4 needs OpenEB 5.3, so `collect_episode.sh`
+launches it inside a container that mounts `~/metavision` as `/work` and runs
+`record_events.py` from there. That directory is a manual copy. It is currently
+byte-identical to the repo, but nothing enforces that -- edit a file under
+`event_camera/` and the collection pipeline keeps running the old one until the
+copy is refreshed.
+
 ## Tools
 
 | Script | Purpose | Touches robot? |
