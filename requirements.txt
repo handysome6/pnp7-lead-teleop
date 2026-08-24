@@ -1,0 +1,23 @@
+# Python runtime dependencies for the tooling around the C++ bridge.
+#
+#   uv venv --python 3.11 .venv
+#   uv pip install --python .venv/bin/python -r requirements.txt
+#
+# Pinned exactly rather than loosely. These are the versions the commissioning
+# record and the accepted episodes were produced with; pyrealsense2 and
+# opencv-python are binary wheels, so re-resolving them is a change to compiled
+# code, not just to Python. Loosen a pin deliberately and re-run check_ready.py
+# and a dry run afterwards, not as a side effect of rebuilding an environment.
+#
+# The C++ bridge uses none of this -- it needs libfranka and the DynamixelSDK
+# C++ tree instead. See "Setting up a checkout" in the README.
+
+numpy==2.4.6
+opencv-python==5.0.0.93
+pyrealsense2==2.58.3.10794
+pyserial==3.5
+dynamixel-sdk==4.0.5
+
+# Optional, imported by nothing here -- kept on record because it is what the
+# scripts were linted with:
+#   pyflakes==3.4.0

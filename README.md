@@ -127,6 +127,59 @@ the grab when the fd closes, including on a crash, so the button cannot be left
 captured. `grab_button.py` does the same thing standalone, for checking the
 takeover without starting the bridge.
 
+## Setting up a checkout
+
+Three of the things this repo needs are deliberately not tracked: `bin/` and
+`.venv/` are build products, and `DynamixelSDK/` is a 43 MB vendored upstream
+tree. A fresh checkout is therefore source only, and `demo.sh` fails on its
+first line with no `.venv/bin/python`. This is what happened when the working
+copy moved to `~/workspace/andyls/pnp7-lead-teleop`; the recovery is below.
+
+Already present on the robot PC, and not rebuilt by any of this:
+
+| | |
+|---|---|
+| libfranka | 0.15.0, built, at `~/catkin_franka/libfranka` |
+| Eigen | `/usr/include/eigen3` |
+| `uv` | `/usr/bin/uv` |
+
+```bash
+cd ~/workspace/andyls/pnp7-lead-teleop
+
+# 1. Vendored Dynamixel SDK -- the C++ tree the bridge links against.
+git clone https://github.com/ROBOTIS-GIT/DynamixelSDK.git
+git -C DynamixelSDK checkout 2ded684              # what this was commissioned on
+make -C DynamixelSDK/c++/build/linux64            # -> libdxl_x64_cpp.so
+
+# 2. Python environment for the tooling.
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+
+# 3. The bridge.
+./build.sh
+```
+
+`build.sh` takes `LIBFRANKA` and `DXL` from the environment, so a machine that
+keeps either tree somewhere else does not need the script edited.
+
+Then confirm the checkout before trusting it, in this order -- each step needs
+strictly more hardware than the one above it, so the first failure tells you
+which layer is wrong:
+
+```bash
+./bin/pnp7_teleop selftest demo.conf     # offline; expect SELFTEST_OK, 11 checks
+.venv/bin/python check_ready.py --config demo.conf
+./bin/pnp7_teleop dry demo.conf 10 /tmp/dry.csv   # expect ~940 Hz, 0 read failures
+```
+
+`check_ready.py` needs the venv's interpreter specifically, and the failure mode
+if you forget is quiet rather than loud. The system `python3` happens to carry
+`cv2`, `numpy` and `pyrealsense2` but not `serial` or `dynamixel_sdk`, so it
+does not crash -- it prints one `[FAIL] lead arm driver import -- No module
+named 'serial'` row and then simply omits the torque and sample-rate gates. The
+result is an `overall: FAIL` that reads like an ordinary hardware fault while
+two of the four lead-arm checks never ran at all.
+
 ## Teleoperation bridge
 
 `pnp7_teleop.cpp` implements roadmap V1. Two threads, per roadmap section 12:
@@ -283,7 +336,7 @@ training action is `q_command`, never the raw master encoder. The delta form
 ## Usage
 
 ```bash
-cd ~/workspace/pnp7_teleop
+cd ~/workspace/andyls/pnp7-lead-teleop
 .venv/bin/python check_ready.py        # all gates must read PASS
 .venv/bin/python calibrate.py --out calibration.json
 ```
