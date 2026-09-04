@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PNP-7 collection</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f25; --line: #2b3038;
+    --fg: #e6e9ef; --dim: #8b94a3;
+    --ok: #35c07a; --warn: #e0a33a; --bad: #e05a5a; --live: #e0453f; --accent: #4b9fe1;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.45 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 5;
+  }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .01em; }
+  .grow { flex: 1; }
+  main { display: grid; grid-template-columns: minmax(0,2fr) minmax(320px,1fr); gap: 14px; padding: 14px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .09em; color: var(--dim); margin: 0 0 10px; font-weight: 600; }
+
+  /* ---- phase + deadman: readable from across the room ---- */
+  .phase {
+    display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px;
+    border-radius: 999px; font-weight: 700; font-size: 13px; letter-spacing: .04em;
+    text-transform: uppercase; border: 1px solid transparent;
+  }
+  .phase[data-p="idle"]      { background: #23262d; color: var(--dim); border-color: var(--line); }
+  .phase[data-p="opening"],
+  .phase[data-p="closing"]   { background: #3a2f14; color: var(--warn); border-color: #5c4a1d; }
+  .phase[data-p="ready"]     { background: #123024; color: var(--ok); border-color: #1d5138; }
+  .phase[data-p="recording"] { background: #3a1412; color: #ff8a84; border-color: #6b201c; }
+  .phase[data-p="error"]     { background: #3a1418; color: var(--bad); border-color: #6b1d24; }
+  .phase[data-p="recording"] .dot { animation: pulse 1s infinite; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: currentColor; }
+  @keyframes pulse { 50% { opacity: .25; } }
+
+  .pedal {
+    display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px;
+    border-radius: 6px; font-weight: 700; font-size: 13px; border: 1px solid var(--line);
+    background: #23262d; color: var(--dim);
+  }
+  .pedal.held { background: #123024; color: var(--ok); border-color: #1d5138; }
+
+  /* ---- cameras ---- */
+  .cams { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 700px) { .cams { grid-template-columns: 1fr; } }
+  .cam { position: relative; background: #0c0d10; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; aspect-ratio: 4/3; }
+  .cam img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .cam .tag { position: absolute; left: 8px; top: 8px; background: rgba(0,0,0,.65); padding: 2px 8px; border-radius: 4px; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--dim); }
+  .cam.rec { border-color: var(--live); box-shadow: 0 0 0 1px var(--live) inset; }
+  .cam .placeholder { display: grid; place-items: center; height: 100%; color: var(--dim); font-size: 12px; text-align: center; padding: 16px; }
+
+  /* ---- controls ---- */
+  button {
+    font: inherit; font-weight: 600; color: var(--fg); background: #262a32;
+    border: 1px solid var(--line); border-radius: 6px; padding: 9px 14px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #2e333c; border-color: #3d444f; }
+  button:disabled { opacity: .35; cursor: not-allowed; }
+  button.primary { background: #1c4a75; border-color: #2a6ba6; }
+  button.primary:hover:not(:disabled) { background: #23598b; }
+  button.danger  { background: #6b201c; border-color: #8c2b26; }
+  button.danger:hover:not(:disabled) { background: #7d2621; }
+  button.wide { width: 100%; }
+  button.big { padding: 14px; font-size: 15px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row > * { flex: 1; min-width: 0; }
+  kbd { font: 11px ui-monospace, monospace; background: #0e1013; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 3px; padding: 0 4px; color: var(--dim); }
+
+  label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--dim); margin: 10px 0 4px; }
+  select, input {
+    width: 100%; font: inherit; color: var(--fg); background: #0e1013;
+    border: 1px solid var(--line); border-radius: 5px; padding: 7px 9px;
+  }
+  .params { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+
+  /* ---- readouts ---- */
+  table { width: 100%; border-collapse: collapse; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  td { padding: 3px 0; }
+  td:first-child { color: var(--dim); }
+  td:last-child { text-align: right; }
+  .joints { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-top: 6px; }
+  .joints div { text-align: center; font: 11px ui-monospace, monospace; background: #0e1013; border: 1px solid var(--line); border-radius: 4px; padding: 4px 0; }
+  .joints div span { display: block; color: var(--dim); font-size: 9px; }
+
+  .msg { font-size: 12px; color: var(--dim); min-height: 18px; }
+  .err { background: #2b1216; border: 1px solid #6b1d24; color: #ff9a95; padding: 8px 10px; border-radius: 6px; font-size: 12px; margin-bottom: 10px; display: none; }
+  .err.show { display: block; }
+  .hint { font-size: 11px; color: var(--dim); margin-top: 8px; }
+  .bar { height: 5px; background: #0e1013; border-radius: 3px; overflow: hidden; margin-top: 6px; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>PNP-7 collection</h1>
+  <span class="phase" id="phase" data-p="idle"><span class="dot"></span><span id="phaseText">idle</span></span>
+  <span class="pedal" id="pedal">F3 <span id="pedalText">released</span></span>
+  <span class="grow"></span>
+  <span class="msg" id="mode"></span>
+</header>
+
+<main>
+  <div>
+    <section>
+      <h2>Cameras</h2>
+      <div class="cams" id="cams"></div>
+      <div class="hint" id="camHint">Previews come from the same frames the environment records — no extra camera load, and no second claim on the device.</div>
+    </section>
+
+    <section>
+      <h2>Episode</h2>
+      <div class="row">
+        <button class="big primary" id="btnStart" disabled>Start episode <kbd>s</kbd></button>
+        <button class="big" id="btnStop" disabled>Stop &amp; keep <kbd>e</kbd></button>
+        <button class="big danger" id="btnDiscard" disabled>Discard <kbd>x</kbd></button>
+      </div>
+      <table style="margin-top:12px">
+        <tr><td>episodes kept / target</td><td id="epCount">0 / 0</td></tr>
+        <tr><td>frames in open episode</td><td id="epSteps">0</td></tr>
+        <tr><td>F3 intervals (segments)</td><td id="epSegs">0</td></tr>
+        <tr><td>frames dropped (F3 released)</td><td id="epSkipped">0</td></tr>
+      </table>
+      <div class="bar"><i id="epBar" style="width:0%"></i></div>
+      <div class="hint">Only frames captured while F3 is held are written. Each
+        held interval gets its own <code>segment_id</code> in the LeRobot episode.</div>
+    </section>
+  </div>
+
+  <div>
+    <div class="err" id="err"></div>
+
+    <section>
+      <h2>Session</h2>
+      <label for="config">Config</label>
+      <select id="config"></select>
+      <div class="params">
+        <div><label for="fps">fps</label><input id="fps" type="number" step="1" min="1" value="10"></div>
+        <div><label for="episodes">episodes</label><input id="episodes" type="number" step="1" min="1" value="20"></div>
+        <div><label for="maxvel">gello max vel</label><input id="maxvel" type="number" step="0.1" min="0.1" value="0.8"></div>
+        <div><label for="maxsteps">max steps/ep</label><input id="maxsteps" type="number" step="10" min="10" value="300"></div>
+      </div>
+      <label for="savedir">save_dir</label>
+      <input id="savedir" placeholder="(from config)">
+      <label for="task">task description</label>
+      <input id="task" placeholder="single-arm PNP7 absolute joint teleoperation">
+
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="btnOpen">Open collect</button>
+        <button id="btnTeleop">Teleop only</button>
+      </div>
+      <button class="wide" id="btnClose" style="margin-top:8px" disabled>Close session</button>
+      <div class="hint">Teleop-only opens the identical stack with the same
+        safety chain, but refuses every recording control — nothing can land on
+        disk by accident.</div>
+    </section>
+
+    <section>
+      <h2>Robot</h2>
+      <button class="wide" id="btnRestore" disabled>Restore start joints</button>
+      <div class="hint">Refused while F3 is held or an episode is open — the move
+        would otherwise be recorded as demonstration.</div>
+      <div class="joints" id="joints"></div>
+      <table style="margin-top:10px">
+        <tr><td>stream</td><td id="stream">—</td></tr>
+        <tr><td>alignment error</td><td id="align">—</td></tr>
+        <tr><td>gripper width</td><td id="grip">—</td></tr>
+        <tr><td>step rate</td><td id="hz">—</td></tr>
+        <tr><td>uptime</td><td id="up">—</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Dataset</h2>
+      <table><tr><td>dir</td><td id="dsdir" style="word-break:break-all">—</td></tr></table>
+      <button class="wide" id="btnFinalize" style="margin-top:8px" disabled>Finalize LeRobot metadata</button>
+      <div class="hint">Writes <code>info.json</code> / <code>stats.json</code>.
+        Until it runs, the shard is on disk but not loadable.</div>
+    </section>
+
+    <section id="mockPanel" style="display:none">
+      <h2>Mock rig</h2>
+      <button class="wide big" id="btnPedal">Hold F3 <kbd>space</kbd></button>
+      <div class="hint">Mock backend only. Hold to simulate the pedal.</div>
+    </section>
+
+    <div class="msg" id="msg"></div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let state = {};
+let camsBuilt = "";
+let isMock = false;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let body = null;
+  try { body = await r.json(); } catch (_) { /* streams and 204s */ }
+  if (!r.ok) throw new Error((body && body.error) || `${r.status} ${r.statusText}`);
+  return body;
+}
+
+async function cmd(name, args = {}) {
+  showErr("");
+  try {
+    await api("/api/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, args }),
+    });
+  } catch (e) { showErr(e.message); }
+  refresh();
+}
+
+function showErr(text) {
+  const el = $("err");
+  el.textContent = text || "";
+  el.classList.toggle("show", !!text);
+}
+
+function buildCams(names, recording) {
+  const key = names.join(",");
+  if (key !== camsBuilt) {
+    camsBuilt = key;
+    $("cams").innerHTML = names.length
+      ? names.map((n) => `
+          <div class="cam" data-cam="${n}">
+            <img src="/stream/${encodeURIComponent(n)}?t=${Date.now()}" alt="${n}">
+            <span class="tag">${n}</span>
+          </div>`).join("")
+      : `<div class="cam"><div class="placeholder">No camera stream.<br>Open a session, or the preview, to see the scene.</div></div>
+         <div class="cam"><div class="placeholder">The environment holds the RealSense pipelines exclusively while a session is open.</div></div>`;
+  }
+  document.querySelectorAll(".cam[data-cam]").forEach((el) => {
+    el.classList.toggle("rec", recording);
+  });
+}
+
+function render(s) {
+  state = s;
+  const live = s.phase === "ready" || s.phase === "recording";
+  const rec = s.phase === "recording";
+  const capturing = rec && s.deadman_held;
+
+  $("phase").dataset.p = s.phase;
+  $("phaseText").textContent = capturing ? "capturing" : s.phase;
+  $("pedal").classList.toggle("held", !!s.deadman_held);
+  $("pedalText").textContent = s.deadman_held ? "held" : "released";
+  $("mode").textContent = s.config_name ? `${s.mode} · ${s.config_name}` : "";
+  $("msg").textContent = s.message || "";
+  showErr(s.error || "");
+
+  buildCams(s.cameras || [], capturing);
+
+  $("btnOpen").disabled = s.phase !== "idle";
+  $("btnTeleop").disabled = s.phase !== "idle";
+  $("btnClose").disabled = !live;
+  $("btnRestore").disabled = s.phase !== "ready" || s.deadman_held;
+  $("btnStart").disabled = s.phase !== "ready" || s.mode === "teleop";
+  $("btnStop").disabled = !rec;
+  $("btnDiscard").disabled = !rec;
+  $("btnFinalize").disabled = !live || s.mode === "teleop";
+
+  $("epCount").textContent = `${s.episode_index} / ${s.episode_target || "—"}`;
+  $("epSteps").textContent = s.episode_steps ?? 0;
+  $("epSegs").textContent = s.episode_segments ?? 0;
+  $("epSkipped").textContent = s.skipped_steps ?? 0;
+  const pct = s.episode_target ? Math.min(100, 100 * s.episode_index / s.episode_target) : 0;
+  $("epBar").style.width = pct + "%";
+
+  $("stream").textContent = s.stream_enabled ? "enabled" : (s.block_reason || "—");
+  $("align").textContent = s.alignment_error == null ? "—" : s.alignment_error.toFixed(4) + " rad";
+  $("grip").textContent = s.gripper_width == null ? "—" : s.gripper_width.toFixed(4) + " m";
+  $("hz").textContent = live ? s.step_hz.toFixed(1) + " Hz" : "—";
+  $("up").textContent = live ? s.uptime_s.toFixed(0) + " s" : "—";
+  $("dsdir").textContent = s.dataset_dir || "—";
+
+  const j = s.joints || [];
+  $("joints").innerHTML = j.length
+    ? j.map((q, i) => `<div><span>J${i + 1}</span>${q.toFixed(2)}</div>`).join("")
+    : "";
+}
+
+async function refresh() {
+  try { render(await api("/api/state")); }
+  catch (e) { showErr("lost the control loop: " + e.message); }
+}
+
+function overrides() {
+  const o = {
+    fps: Number($("fps").value),
+    num_data_episodes: Number($("episodes").value),
+    gello_joint_max_velocity: Number($("maxvel").value),
+    max_episode_steps: Number($("maxsteps").value),
+  };
+  if ($("savedir").value.trim()) o.save_dir = $("savedir").value.trim();
+  if ($("task").value.trim()) o.task_description = $("task").value.trim();
+  return o;
+}
+
+const open = (mode) => cmd("open_session", {
+  config_name: $("config").value, overrides: overrides(), mode,
+});
+
+$("btnOpen").onclick     = () => open("collect");
+$("btnTeleop").onclick   = () => open("teleop");
+$("btnClose").onclick    = () => cmd("close_session");
+$("btnRestore").onclick  = () => cmd("restore_joints");
+$("btnStart").onclick    = () => cmd("begin_episode");
+$("btnStop").onclick     = () => cmd("end_episode");
+$("btnDiscard").onclick  = () => cmd("discard_episode");
+$("btnFinalize").onclick = () => cmd("finalize_dataset");
+
+// Mock pedal: hold, never toggle, so it behaves like the real hold-to-enable.
+async function setPedal(held) {
+  if (!isMock) return;
+  try {
+    await api("/api/mock/deadman", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ held }),
+    });
+  } catch (e) { showErr(e.message); }
+}
+$("btnPedal").addEventListener("mousedown", () => setPedal(true));
+$("btnPedal").addEventListener("touchstart", (e) => { e.preventDefault(); setPedal(true); });
+["mouseup", "mouseleave", "touchend"].forEach((ev) =>
+  $("btnPedal").addEventListener(ev, () => setPedal(false)));
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if (e.code === "Space" && !e.repeat) { e.preventDefault(); setPedal(true); return; }
+  if (e.repeat) return;
+  if (e.key === "s" && !$("btnStart").disabled) $("btnStart").click();
+  if (e.key === "e" && !$("btnStop").disabled) $("btnStop").click();
+  if (e.key === "x" && !$("btnDiscard").disabled) $("btnDiscard").click();
+});
+document.addEventListener("keyup", (e) => {
+  if (e.code === "Space") { e.preventDefault(); setPedal(false); }
+});
+
+(async function init() {
+  try {
+    const info = await api("/api/configs");
+    $("config").innerHTML = info.configs
+      .map((c) => `<option value="${c.name}">${c.name}</option>`).join("");
+    isMock = !!info.mock;
+  } catch (e) { showErr(e.message); }
+  if (isMock) $("mockPanel").style.display = "";
+  refresh();
+  setInterval(refresh, 250);
+})();
+</script>
+</body>
+</html>
