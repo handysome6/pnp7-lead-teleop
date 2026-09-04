@@ -14,15 +14,44 @@ lands in the dataset, and none of them need a foot pedal to test.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import socket
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
+from gui.legacy_backend import LegacyBackend
 from gui.mock import MockBackend
 from gui.server import serve
 from gui.session import ControlLoop
+
+REPO = Path(__file__).resolve().parent.parent
+
+#: A config with everything `home` and the status publisher need. Written for
+#: the stub bridge, but every key here is one the real loadConfig accepts.
+STUB_CONFIG = """\
+lead_port=/dev/pnp7_lead
+lead_baud=1000000
+robot_ip=172.16.0.2
+deadman_device=/dev/pnp7_deadman
+deadman_key=KEY_F3
+deadman_grab=1
+lead_servo_id=1 2 3 4 5 6 7
+sign=1 -1 1 -1 1 1 1
+scale=0.5 0.5 0.5 0.5 0.5 0.5 0.5
+enabled_joints=1111111
+lowpass_hz=6.0
+max_joint_velocity=0.3
+max_joint_acceleration=1.5
+max_session_delta=0.5
+watchdog_ms=100
+home_qpos=0.0 -0.785 0.0 -2.356 0.0 1.571 0.785
+"""
 
 
 class Client:
@@ -92,14 +121,14 @@ def run_checks(c: Client, r: Report) -> None:  # noqa: C901 - a linear script
 
     print("\n-- open a collect session (item 3) ----------------------------")
     c.cmd("open_session", config_name="realworld_collect_data_gello_franky",
-          overrides={"fps": 10, "num_data_episodes": 5,
-                     "save_dir": "/tmp/mock_ds"},
+          overrides={"duration": 60, "prefix": "ep",
+                     "episodes_dir": "/tmp/mock_ds"},
           mode="collect")
     s = c.state()
     r.check("phase -> ready", s["phase"] == "ready", s["phase"])
     r.check("both cameras announced (item 2)",
             s["cameras"] == ["external", "wrist"], str(s["cameras"]))
-    r.check("save_dir override applied",
+    r.check("episodes_dir override applied",
             s["dataset_dir"] == "/tmp/mock_ds", str(s["dataset_dir"]))
     time.sleep(0.6)
     hz = c.state()["step_hz"]
@@ -214,6 +243,191 @@ def run_checks(c: Client, r: Report) -> None:  # noqa: C901 - a linear script
             c.cmd("definitely_not_a_command").get("http_error") == 409)
 
 
+def run_orchestration_checks(r: Report) -> None:
+    """Drive the real supervisor against stand-in hardware.
+
+    The point of this phase is that `build_episode.py` and
+    `validate_episode.py` are the genuine articles here -- only the bridge and
+    the camera recorder are stubs. So the join, the F3 clipping and the
+    validation are all exercised for real, on a laptop, which is most of what
+    could quietly break.
+    """
+    workspace = Path(tempfile.mkdtemp(prefix="pnp7_gui_selftest_"))
+    pedal = workspace / "pedal"
+    os.environ["PNP7_STUB_PEDAL"] = str(pedal)
+
+    conf_dir = workspace / "conf"
+    conf_dir.mkdir()
+    (conf_dir / "stub.conf").write_text(STUB_CONFIG)
+
+    backend = LegacyBackend(
+        episodes_dir=workspace / "episodes",
+        preview_dir=workspace / "preview",
+        status_path=workspace / "status.json",
+        bridge=REPO / "gui" / "stubs" / "bridge.py",
+        python=sys.executable,
+        recorder=REPO / "gui" / "stubs" / "cameras.py",
+        conf_dir=conf_dir,
+        scratch_dir=workspace,
+    )
+    port = _free_port()
+    loop = ControlLoop(backend, fps=10.0)
+    loop.start()
+    server = serve(loop, host="127.0.0.1", port=port)
+    time.sleep(0.3)
+    c = Client(f"http://127.0.0.1:{port}")
+
+    try:
+        print("\n-- supervised session over stub hardware ----------------------")
+        r.check("stub config is offered",
+                any(cfg["name"] == "stub"
+                    for cfg in json.loads(urllib.request.urlopen(
+                        c.base + "/api/configs", timeout=10).read())["configs"]))
+
+        result = c.cmd("open_session", config_name="stub",
+                       overrides={"duration": 30, "prefix": "ep",
+                                  "episodes_dir": str(workspace / "episodes")},
+                       mode="collect")
+        state = c.state()
+        r.check("session opens", state["phase"] == "ready",
+                str(result.get("error") or state["phase"]))
+        r.check("viewfinder announces both cameras",
+                state["cameras"] == ["external", "wrist"], str(state["cameras"]))
+        r.check("preview frames are published",
+                (workspace / "preview" / "external.jpg").is_file())
+
+        print("\n-- restore the arm (item 1) -----------------------------------")
+        r.check("home accepted with the pedal up",
+                c.cmd("restore_joints").get("accepted") is True)
+        pedal.touch()
+        time.sleep(0.2)
+        refused = c.cmd("restore_joints")
+        r.check("home refused with the pedal held",
+                refused.get("accepted") is False, str(refused.get("error"))[:70])
+        pedal.unlink(missing_ok=True)
+
+        print("\n-- a take, with the pedal released in the middle ---------------")
+        c.cmd("begin_episode")
+        r.check("phase -> recording", c.state()["phase"] == "recording")
+
+        pedal.touch()
+        time.sleep(1.8)
+        mid = c.state()
+        r.check("bridge status reaches the GUI", mid["deadman_held"] is True,
+                str(mid.get("block_reason")))
+        r.check("joints arrive from the status file",
+                len(mid["joints"]) == 7, str(len(mid["joints"])))
+
+        pedal.unlink(missing_ok=True)
+        time.sleep(0.8)
+        gap = c.state()
+        r.check("pedal release is visible", gap["deadman_held"] is False)
+
+        pedal.touch()
+        time.sleep(1.8)
+        pedal.unlink(missing_ok=True)
+        time.sleep(0.3)
+
+        print("\n-- stop & keep: real build_episode + validate_episode ----------")
+        c.cmd("end_episode", timeout=180)
+        state = c.state()
+        r.check("returns to ready", state["phase"] == "ready", state["phase"])
+        r.check("episode counted", state["episode_index"] == 1,
+                str(state["episode_index"]))
+        r.note(f"message: {state['message']}")
+
+        episode = workspace / "episodes" / "ep001"
+        r.check("teleop.csv written", (episode / "teleop.csv").is_file())
+        r.check("episode.csv built by build_episode.py",
+                (episode / "episode.csv").is_file())
+
+        meta_path = episode / "episode_meta.json"
+        r.check("episode_meta.json written", meta_path.is_file())
+        if meta_path.is_file():
+            meta = json.loads(meta_path.read_text())
+            r.note(f"frames={meta.get('frames')} "
+                   f"dropped_idle={meta.get('dropped_idle_frames')} "
+                   f"rate={meta.get('rate_hz')} Hz")
+            r.check("frames survived the join", meta.get("frames", 0) > 0,
+                    str(meta.get("frames")))
+            # This is the whole architectural claim: released-pedal frames are
+            # dropped downstream, by build_episode.py, from the deadman column.
+            r.check("released-pedal frames were dropped downstream",
+                    meta.get("dropped_idle_frames", 0) > 0,
+                    str(meta.get("dropped_idle_frames")))
+
+        print("\n-- the converter reads what build_episode wrote ----------------")
+        # The fixture used to develop export_lerobot.py had hand-written column
+        # names. This is the same check against the real thing, so a rename in
+        # build_episode.py cannot silently break conversion.
+        export = subprocess.run(
+            [sys.executable, str(REPO / "collect" / "export_lerobot.py"),
+             str(episode), "--out", str(workspace / "ds"),
+             "--task", "stub", "--dry-run"],
+            capture_output=True, text=True, cwd=str(REPO), timeout=120)
+        r.check("export_lerobot accepts a real episode",
+                export.returncode == 0,
+                (export.stderr or "").strip().splitlines()[-1:] and
+                (export.stderr or "").strip().splitlines()[-1] or "")
+        r.check("it finds the two F3 segments",
+                "2 segment(s)" in export.stdout,
+                export.stdout.strip().splitlines()[-1] if export.stdout else "")
+        r.check("a dry run writes nothing", not (workspace / "ds").exists())
+
+        print("\n-- config keys the GUI appends are real ones -------------------")
+        # loadConfig silently ignores unknown keys, so a typo here would be
+        # invisible: the bridge would simply never publish status and the GUI
+        # would report a startup timeout with no hint why.
+        bridge_src = (REPO / "src" / "pnp7_teleop.cpp").read_text()
+        prepared = (workspace / "conf" / "stub.conf")
+        appended = [line.split("=", 1)[0].strip()
+                    for line in (episode / "config.conf").read_text().splitlines()
+                    if "=" in line and not line.strip().startswith("#")]
+        unknown = [k for k in appended if f'key == "{k}"' not in bridge_src]
+        r.check("every key in the episode's config.conf is one loadConfig parses",
+                not unknown, str(unknown))
+        r.check("status_path was actually appended", "status_path" in appended)
+        del prepared
+
+        print("\n-- discard really deletes -------------------------------------")
+        c.cmd("begin_episode")
+        pedal.touch()
+        time.sleep(0.6)
+        pedal.unlink(missing_ok=True)
+        before = c.state()["episode_index"]
+        c.cmd("discard_episode", timeout=120)
+        r.check("discard returns to ready", c.state()["phase"] == "ready")
+        r.check("discard does not count the episode",
+                c.state()["episode_index"] == before)
+        r.check("discarded directory is gone -- not merely reported",
+                not (workspace / "episodes" / "ep002").exists())
+
+        print("\n-- teleop-only mode (item 7) ----------------------------------")
+        c.cmd("close_session")
+        c.cmd("open_session", config_name="stub",
+              overrides={"teleop_duration": 30}, mode="teleop")
+        state = c.state()
+        r.check("teleop session ready",
+                state["phase"] == "ready" and state["mode"] == "teleop",
+                f"{state['phase']}/{state['mode']}")
+        r.check("recording refused in teleop mode",
+                c.cmd("begin_episode").get("http_error") == 409)
+        pedal.touch()
+        time.sleep(0.5)
+        r.check("teleop still reports the pedal",
+                c.state()["deadman_held"] is True)
+        pedal.unlink(missing_ok=True)
+        c.cmd("close_session", timeout=120)
+        r.check("session closed", c.state()["phase"] == "idle")
+        r.check("no episode directory was created by teleop",
+                not (workspace / "episodes" / "ep002").exists())
+    finally:
+        server.shutdown()
+        loop.stop()
+        os.environ.pop("PNP7_STUB_PEDAL", None)
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 def main() -> int:
     port = _free_port()
     backend = MockBackend()
@@ -229,6 +443,9 @@ def main() -> int:
     finally:
         server.shutdown()
         loop.stop()
+
+    # Second phase: the real supervisor, stubbed hardware, real post-processing.
+    run_orchestration_checks(report)
 
     print()
     if report.failures:

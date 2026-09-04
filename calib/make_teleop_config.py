@@ -209,6 +209,20 @@ def main() -> int:
         f"lead_deadband={args.lead_deadband}",
     ]
 
+    # Where `pnp7_teleop home` drives the arm. Taken from the pose the
+    # calibration was captured at, because that is the configuration the lead
+    # arm's neutral corresponds to -- homing anywhere else would leave the two
+    # arms out of correspondence from the first take. Omitted rather than
+    # guessed when the calibration has no rest pose: `home` refuses to run
+    # without the key, which is better than moving to a default nobody chose.
+    rest = (cal.get("franka_rest_pose") or {}).get("q")
+    if rest and len(rest) == len(JOINTS):
+        lines += [
+            "",
+            "# Joint pose `home` mode drives to, from the calibration posture.",
+            f"home_qpos={' '.join(f'{v:.6f}' for v in rest)}",
+        ]
+
     grip = cal.get("gripper", {})
     lo, hi = grip.get("min_ticks"), grip.get("max_ticks")
     if args.gripper:
@@ -247,6 +261,12 @@ def main() -> int:
     print(f"  deadman        : {deadman}  key {args.deadman_key}"
           + ("  (NOT grabbed -- desktop still sees it)"
              if args.no_deadman_grab else "  (exclusive)"))
+    if rest and len(rest) == len(JOINTS):
+        print("  home pose      : "
+              + " ".join(f"{v:.3f}" for v in rest))
+    else:
+        print("  home pose      : ABSENT -- `pnp7_teleop home` will refuse; "
+              "re-run calibrate.py to capture franka_rest_pose")
     print(f"  lead deadband  : {args.lead_deadband} counts "
           f"({args.lead_deadband * 360.0 / 4096.0:.3f} deg of lead motion)")
     if args.gripper:

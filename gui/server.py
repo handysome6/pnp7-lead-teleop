@@ -183,18 +183,22 @@ class GuiHandler(http.server.BaseHTTPRequestHandler):
         try:
             while True:
                 t0 = time.perf_counter()
-                frame = backend.latest_frame(camera)
-                if frame is not None:
-                    ok, buf = cv2.imencode(
-                        ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-                    if ok:
-                        chunk = buf.tobytes()
-                        self.wfile.write(f"--{BOUNDARY}\r\n".encode())
-                        self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                        self.wfile.write(
-                            f"Content-Length: {len(chunk)}\r\n\r\n".encode())
-                        self.wfile.write(chunk)
-                        self.wfile.write(b"\r\n")
+                # A backend that already holds JPEG bytes hands them straight
+                # over; only raw-array backends pay for an encode here.
+                chunk = backend.latest_jpeg(camera)
+                if chunk is None:
+                    frame = backend.latest_frame(camera)
+                    if frame is not None:
+                        ok, buf = cv2.imencode(
+                            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                        chunk = buf.tobytes() if ok else None
+                if chunk:
+                    self.wfile.write(f"--{BOUNDARY}\r\n".encode())
+                    self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                    self.wfile.write(
+                        f"Content-Length: {len(chunk)}\r\n\r\n".encode())
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
                 elapsed = time.perf_counter() - t0
                 if elapsed < period:
                     time.sleep(period - elapsed)

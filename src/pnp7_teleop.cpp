@@ -151,6 +151,14 @@ struct Config {
       {1.50, 1.50, 1.50, 1.50, 1.50, 1.50, 1.50}};
   double max_session_delta{0.50};
   int watchdog_ms{100};
+
+  // Joint configuration `home` mode drives to. There is deliberately no
+  // default: relative teleoperation never establishes an absolute pose, so a
+  // guessed home would be a guess about which robot this is. `home` refuses to
+  // run without it. The value belongs to the rig, not to the bridge --
+  // calibration.json's franka_rest_pose is where it comes from.
+  std::array<double, kNumJoints> home_qpos{};
+  bool home_qpos_set{false};
   // Encoder counts of hysteresis applied to the lead arm before scaling.
   // 0 disables it.
   double lead_deadband{2.0};
@@ -336,6 +344,12 @@ Config loadConfig(const std::string& path) {
       if (words.size() != kNumJoints)
         throw std::invalid_argument("lead_servo_id needs 7 entries");
       for (int i = 0; i < kNumJoints; ++i) c.servo_id[i] = std::stoi(words[i]);
+    } else if (key == "home_qpos") {
+      const auto words = splitWords(value);
+      if (words.size() != kNumJoints)
+        throw std::invalid_argument("home_qpos needs 7 entries");
+      for (int i = 0; i < kNumJoints; ++i) c.home_qpos[i] = std::stod(words[i]);
+      c.home_qpos_set = true;
     } else if (key == "sign") {
       const auto words = splitWords(value);
       if (words.size() != kNumJoints)
@@ -507,6 +521,17 @@ bool testBit(const unsigned long* bits, int bit) {
           (bit % (8 * sizeof(unsigned long)))) & 1UL;
 }
 
+// Whether the key is physically down at this instant, asked of the kernel
+// rather than tracked from the event stream. Used in two places: the dead-man
+// latches "awaiting release" when it finds the button already held at startup,
+// and `home` refuses to move the arm while the pedal is down.
+bool keyHeldNow(int fd, int key_code) {
+  unsigned long bits[(KEY_MAX + 8 * sizeof(unsigned long)) /
+                     (8 * sizeof(unsigned long))]{};
+  return ioctl(fd, EVIOCGKEY(sizeof(bits)), bits) >= 0 &&
+         testBit(bits, key_code);
+}
+
 // Hold-to-enable on one key of a dedicated input device. A press is only
 // honoured after a release has been seen, so a button already held at startup
 // cannot enable motion.
@@ -554,9 +579,7 @@ class DeadmanReader {
       grabbed_ = true;
     }
 
-    std::memset(bits, 0, sizeof(bits));
-    if (ioctl(fd_, EVIOCGKEY(sizeof(bits)), bits) >= 0 &&
-        testBit(bits, key_code_)) {
+    if (keyHeldNow(fd_, key_code_)) {
       // Held at startup: require a full release first.
       awaiting_release_.store(true);
     }
@@ -1324,8 +1347,17 @@ int runDry(const Config& config, double duration_s, const std::string& log_path)
                         config.deadman_grab);
   deadman.open();
 
+  // Dry mode publishes status too, so a supervising GUI sees the same
+  // telemetry whether or not the robot is being commanded. Without this, dry
+  // runs look identical to a bridge that failed to start.
+  StatusPublisher status(config.status_path);
+  if (!config.status_path.empty()) {
+    std::cout << "publishing status to " << config.status_path << "\n";
+  }
+
   lead.start();
   deadman.start();
+  status.start();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   // Stand in for the robot: start from a plausible Panda rest pose.
@@ -1404,10 +1436,15 @@ int runDry(const Config& config, double duration_s, const std::string& log_path)
       row.gripper_width = -1.0;
       row.gripper_target = -1.0;
     }
+
+    status.update(static_cast<int>(state), deadman.pressed(), chain.target(),
+                  chain.target(), -1.0, -1.0, snap.seq,
+                  (now - lead.lastGoodNs()) / 1e6);
   }
 
   lead.stop();
   deadman.stop();
+  status.stop();
   writeLog(log_path, rows, count);
   std::cout << "dry run done. lead read_failures=" << lead.readFailures()
             << " rejected_jumps=" << lead.rejectedJumps() << "\n";
@@ -1576,9 +1613,139 @@ int runRobot(const Config& config, double duration_s,
 
 void handleSignal(int) { g_interrupted.store(true); }
 
+// ----------------------------------------------------------------- home ---
+
+// Drive the arm to the configured joint pose and stop. This is the one motion
+// in the bridge that is not teleoperation, and it exists because relative joint
+// mapping has no notion of an absolute pose: after a session the arm is
+// wherever the operator left it, and the next session's clutch origin is
+// captured from there. Getting back to a known configuration is otherwise a
+// manual job with the brakes released.
+//
+// The profile is a quintic in normalised time, so velocity and acceleration are
+// both zero at each end. That matters for more than smoothness: libfranka
+// rejects a motion that finishes with non-zero velocity, which is the same
+// reason the teleop path decelerates through hold() before reporting
+// motion_finished.
+int runHome(const Config& config) {
+  if (!config.home_qpos_set) {
+    throw std::runtime_error(
+        "home refused: this config has no home_qpos. Add seven joint angles "
+        "in radians, or regenerate the config from calibration.json");
+  }
+
+  // The dead-man is checked but never grabbed: home is not teleoperation, and
+  // grabbing would fight a bridge that might still be shutting down. A pedal
+  // held now means the operator has their foot on it expecting teleop, which is
+  // not a moment to start an autonomous move.
+  if (!config.deadman_device.empty()) {
+    const int fd = ::open(config.deadman_device.c_str(), O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+      throw std::runtime_error("cannot open deadman device " +
+                               config.deadman_device);
+    }
+    const bool held = keyHeldNow(fd, config.deadman_key);
+    ::close(fd);
+    if (held) {
+      throw std::runtime_error(
+          "home refused: the dead-man is held. Release it first -- this move "
+          "is not teleoperation and must not start under a held pedal");
+    }
+  }
+
+  // Clamp into the same envelope the safety chain enforces, so home can never
+  // ask for a pose teleoperation would refuse to hold.
+  std::array<double, kNumJoints> target = config.home_qpos;
+  for (int i = 0; i < kNumJoints; ++i) {
+    const double lo = kQMin[i] + kJointLimitMargin;
+    const double hi = kQMax[i] - kJointLimitMargin;
+    target[i] = std::min(std::max(target[i], lo), hi);
+  }
+
+  franka::Robot robot(config.robot_ip);
+  const franka::RobotState before = robot.readOnce();
+  if (before.robot_mode != franka::RobotMode::kIdle) {
+    throw std::runtime_error(
+        "preflight refused: robot must be kIdle (brakes open, FCI active)");
+  }
+  if (before.current_errors) {
+    throw std::runtime_error("preflight refused: robot reports current errors");
+  }
+
+  const std::array<double, kNumJoints> start = before.q;
+  double max_delta = 0.0;
+  for (int i = 0; i < kNumJoints; ++i)
+    max_delta = std::max(max_delta, std::abs(target[i] - start[i]));
+
+  std::cout << "home: from";
+  for (double v : start)
+    std::cout << " " << std::fixed << std::setprecision(4) << v;
+  std::cout << "\n      to  ";
+  for (double v : target)
+    std::cout << " " << std::fixed << std::setprecision(4) << v;
+  std::cout << "\n      max delta " << max_delta << " rad\n";
+
+  if (max_delta < 1e-4) {
+    std::cout << "HOME_OK already there\n";
+    return 0;
+  }
+
+  // Duration from the configured per-joint limits, whichever binds. For the
+  // quintic s(t), peak velocity is 1.875*d/T and peak acceleration
+  // 5.7735*d/T^2, so invert both and take the slowest joint.
+  double duration = 0.5;
+  for (int i = 0; i < kNumJoints; ++i) {
+    const double d = std::abs(target[i] - start[i]);
+    if (d < 1e-9) continue;
+    duration = std::max(duration, 1.875 * d / config.max_joint_velocity[i]);
+    duration =
+        std::max(duration, std::sqrt(5.7735 * d / config.max_joint_acceleration[i]));
+  }
+  std::cout << "      over " << duration << " s\n";
+
+  // Scales how fast normalised time advances. A SIGINT decays it to zero over
+  // kStopS instead of finishing on the spot, because an abrupt stop is exactly
+  // the non-zero final velocity libfranka refuses.
+  double rate = 1.0;
+  constexpr double kStopS = 0.3;
+  bool stopping = false;
+  double s_param = 0.0;
+
+  robot.control([&](const franka::RobotState&,
+                    franka::Duration period) -> franka::JointPositions {
+    const double dt = period.toSec();
+    if (g_interrupted.load()) stopping = true;
+    if (stopping) rate = std::max(0.0, rate - dt / kStopS);
+
+    s_param = std::min(1.0, s_param + rate * dt / duration);
+    const double poly = s_param * s_param * s_param *
+                        (10.0 + s_param * (-15.0 + 6.0 * s_param));
+
+    std::array<double, kNumJoints> q{};
+    for (int i = 0; i < kNumJoints; ++i)
+      q[i] = start[i] + (target[i] - start[i]) * poly;
+
+    franka::JointPositions output(q);
+    // Both endings are at rest: s_param saturates at 1 where the quintic's
+    // derivative is zero, and the interrupt path stops advancing it at all.
+    if (s_param >= 1.0 || (stopping && rate <= 0.0)) {
+      output.motion_finished = true;
+    }
+    return output;
+  });
+
+  if (stopping && s_param < 1.0) {
+    std::cout << "HOME_INTERRUPTED at " << (s_param * 100.0) << "%\n";
+    return 1;
+  }
+  std::cout << "HOME_OK\n";
+  return 0;
+}
+
 void printUsage(const char* program) {
   std::cout << "usage:\n"
             << "  " << program << " selftest <config>\n"
+            << "  " << program << " home <config>\n"
             << "  " << program << " dry <config> <seconds> [log.csv]\n"
             << "  " << program << " robot <config> <seconds> [log.csv]\n";
 }
@@ -1598,6 +1765,7 @@ int main(int argc, char** argv) {
     const Config config = loadConfig(argv[2]);
 
     if (mode == "selftest") return runSelfTest(config);
+    if (mode == "home") return runHome(config);
 
     if (argc < 4) {
       printUsage(argv[0]);

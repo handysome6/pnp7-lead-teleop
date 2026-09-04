@@ -57,7 +57,11 @@
   .cam img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .cam .tag { position: absolute; left: 8px; top: 8px; background: rgba(0,0,0,.65); padding: 2px 8px; border-radius: 4px; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--dim); }
   .cam.rec { border-color: var(--live); box-shadow: 0 0 0 1px var(--live) inset; }
-  .cam .placeholder { display: grid; place-items: center; height: 100%; color: var(--dim); font-size: 12px; text-align: center; padding: 16px; }
+  /* flex, not grid: grid would put the label and the status in separate
+     rows and stretch them to the corners. */
+  .cam .placeholder { display: flex; flex-direction: column; gap: 4px;
+    align-items: center; justify-content: center; height: 100%;
+    color: var(--dim); font-size: 12px; text-align: center; padding: 16px; }
 
   /* ---- controls ---- */
   button {
@@ -82,6 +86,11 @@
     border: 1px solid var(--line); border-radius: 5px; padding: 7px 9px;
   }
   .params { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+  label.check {
+    display: flex; align-items: center; gap: 8px; text-transform: none;
+    letter-spacing: 0; font-size: 12.5px; color: var(--fg); margin-top: 12px;
+  }
+  label.check input { width: auto; }
 
   /* ---- readouts ---- */
   table { width: 100%; border-collapse: collapse; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -115,7 +124,10 @@
     <section>
       <h2>Cameras</h2>
       <div class="cams" id="cams"></div>
-      <div class="hint" id="camHint">Previews come from the same frames the environment records — no extra camera load, and no second claim on the device.</div>
+      <div class="hint" id="camHint">Previews are the frames the recorder already
+        captured, so they cost no extra camera load. Every RealSense pipeline is
+        exclusive, which is why the viewfinder has to let go before a take can
+        record.</div>
     </section>
 
     <section>
@@ -126,14 +138,17 @@
         <button class="big danger" id="btnDiscard" disabled>Discard <kbd>x</kbd></button>
       </div>
       <table style="margin-top:12px">
-        <tr><td>episodes kept / target</td><td id="epCount">0 / 0</td></tr>
-        <tr><td>frames in open episode</td><td id="epSteps">0</td></tr>
-        <tr><td>F3 intervals (segments)</td><td id="epSegs">0</td></tr>
-        <tr><td>frames dropped (F3 released)</td><td id="epSkipped">0</td></tr>
+        <tr><td>episodes kept</td><td id="epCount">0</td></tr>
+        <tr><td>F3 held</td><td id="epSteps">0.0 s</td></tr>
+        <tr><td>F3 intervals</td><td id="epSegs">0</td></tr>
+        <tr><td>released</td><td id="epSkipped">0.0 s</td></tr>
       </table>
       <div class="bar"><i id="epBar" style="width:0%"></i></div>
-      <div class="hint">Only frames captured while F3 is held are written. Each
-        held interval gets its own <code>segment_id</code> in the LeRobot episode.</div>
+      <div class="hint">Live figures are sampled from the bridge at 10 Hz, so they
+        are seconds of pedal, not frames. <code>build_episode.py</code> drops the
+        released rows when the take ends and reports the exact frame count —
+        clipping happens there, on data already on disk, so it can be re-derived
+        with different settings later.</div>
     </section>
   </div>
 
@@ -145,24 +160,25 @@
       <label for="config">Config</label>
       <select id="config"></select>
       <div class="params">
-        <div><label for="fps">fps</label><input id="fps" type="number" step="1" min="1" value="10"></div>
-        <div><label for="episodes">episodes</label><input id="episodes" type="number" step="1" min="1" value="20"></div>
-        <div><label for="maxvel">gello max vel</label><input id="maxvel" type="number" step="0.1" min="0.1" value="0.8"></div>
-        <div><label for="maxsteps">max steps/ep</label><input id="maxsteps" type="number" step="10" min="10" value="300"></div>
+        <div><label for="duration">episode cap (s)</label><input id="duration" type="number" step="10" min="5" value="60"></div>
+        <div><label for="prefix">episode prefix</label><input id="prefix" value="ep"></div>
       </div>
-      <label for="savedir">save_dir</label>
-      <input id="savedir" placeholder="(from config)">
-      <label for="task">task description</label>
-      <input id="task" placeholder="single-arm PNP7 absolute joint teleoperation">
+      <label for="episodesdir">episodes directory</label>
+      <input id="episodesdir" value="episodes">
+      <label class="check"><input type="checkbox" id="dryrun"> dry run — exercise everything, command nothing</label>
 
       <div class="row" style="margin-top:12px">
         <button class="primary" id="btnOpen">Open collect</button>
         <button id="btnTeleop">Teleop only</button>
       </div>
       <button class="wide" id="btnClose" style="margin-top:8px" disabled>Close session</button>
-      <div class="hint">Teleop-only opens the identical stack with the same
-        safety chain, but refuses every recording control — nothing can land on
-        disk by accident.</div>
+      <div class="hint">The bridge is given the episode cap as its run length and
+        buffers the whole log in RAM, so a take ends itself at the cap. Teleop-only
+        runs the same bridge with no log path — nothing can land on disk.</div>
+      <div class="hint" style="color:var(--warn)"><b>Release F3 before starting a
+        take.</b> A pedal already held when the bridge starts is latched out until
+        it is released once, and the bridge reports that identically to not
+        pressing at all.</div>
     </section>
 
     <section>
@@ -173,7 +189,7 @@
       <div class="joints" id="joints"></div>
       <table style="margin-top:10px">
         <tr><td>stream</td><td id="stream">—</td></tr>
-        <tr><td>alignment error</td><td id="align">—</td></tr>
+        <tr><td>lead sample age</td><td id="align">—</td></tr>
         <tr><td>gripper width</td><td id="grip">—</td></tr>
         <tr><td>step rate</td><td id="hz">—</td></tr>
         <tr><td>uptime</td><td id="up">—</td></tr>
@@ -181,11 +197,12 @@
     </section>
 
     <section>
-      <h2>Dataset</h2>
+      <h2>Episodes</h2>
       <table><tr><td>dir</td><td id="dsdir" style="word-break:break-all">—</td></tr></table>
-      <button class="wide" id="btnFinalize" style="margin-top:8px" disabled>Finalize LeRobot metadata</button>
-      <div class="hint">Writes <code>info.json</code> / <code>stats.json</code>.
-        Until it runs, the shard is on disk but not loadable.</div>
+      <button class="wide" id="btnFinalize" style="margin-top:8px" disabled>Re-validate all episodes</button>
+      <div class="hint">Runs <code>validate_episode.py</code> over the directory.
+        LeRobot conversion is a separate offline step —
+        <code>collect/export_lerobot.py</code>, in the RLinf environment.</div>
     </section>
 
     <section id="mockPanel" style="display:none">
@@ -201,7 +218,8 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let state = {};
-let camsBuilt = "";
+let camsBuilt = null;   // not "": that equals the empty join, so the
+                        // idle state would never draw its placeholders
 let isMock = false;
 
 async function api(path, opts) {
@@ -240,8 +258,8 @@ function buildCams(names, recording) {
             <img src="/stream/${encodeURIComponent(n)}?t=${Date.now()}" alt="${n}">
             <span class="tag">${n}</span>
           </div>`).join("")
-      : `<div class="cam"><div class="placeholder">No camera stream.<br>Open a session, or the preview, to see the scene.</div></div>
-         <div class="cam"><div class="placeholder">The environment holds the RealSense pipelines exclusively while a session is open.</div></div>`;
+      : `<div class="cam"><div class="placeholder">external<br><span style="opacity:.6">no stream — open a session</span></div></div>
+         <div class="cam"><div class="placeholder">wrist<br><span style="opacity:.6">no stream — open a session</span></div></div>`;
   }
   document.querySelectorAll(".cam[data-cam]").forEach((el) => {
     el.classList.toggle("rec", recording);
@@ -273,15 +291,21 @@ function render(s) {
   $("btnDiscard").disabled = !rec;
   $("btnFinalize").disabled = !live || s.mode === "teleop";
 
-  $("epCount").textContent = `${s.episode_index} / ${s.episode_target || "—"}`;
-  $("epSteps").textContent = s.episode_steps ?? 0;
+  // The backend samples the bridge at 10 Hz, so these counts are tenths of a
+  // second of pedal rather than frames.
+  const held = (s.episode_steps ?? 0) / 10;
+  const released = (s.skipped_steps ?? 0) / 10;
+  $("epCount").textContent = s.episode_index;
+  $("epSteps").textContent = held.toFixed(1) + " s";
   $("epSegs").textContent = s.episode_segments ?? 0;
-  $("epSkipped").textContent = s.skipped_steps ?? 0;
-  const pct = s.episode_target ? Math.min(100, 100 * s.episode_index / s.episode_target) : 0;
-  $("epBar").style.width = pct + "%";
+  $("epSkipped").textContent = released.toFixed(1) + " s";
+  // Progress against the episode cap the bridge was launched with.
+  const cap = Number($("duration").value) || 0;
+  const elapsed = held + released;
+  $("epBar").style.width = (rec && cap ? Math.min(100, 100 * elapsed / cap) : 0) + "%";
 
   $("stream").textContent = s.stream_enabled ? "enabled" : (s.block_reason || "—");
-  $("align").textContent = s.alignment_error == null ? "—" : s.alignment_error.toFixed(4) + " rad";
+  $("align").textContent = s.lead_age_ms == null ? "—" : s.lead_age_ms.toFixed(1) + " ms";
   $("grip").textContent = s.gripper_width == null ? "—" : s.gripper_width.toFixed(4) + " m";
   $("hz").textContent = live ? s.step_hz.toFixed(1) + " Hz" : "—";
   $("up").textContent = live ? s.uptime_s.toFixed(0) + " s" : "—";
@@ -299,15 +323,15 @@ async function refresh() {
 }
 
 function overrides() {
-  const o = {
-    fps: Number($("fps").value),
-    num_data_episodes: Number($("episodes").value),
-    gello_joint_max_velocity: Number($("maxvel").value),
-    max_episode_steps: Number($("maxsteps").value),
+  return {
+    duration: Number($("duration").value),
+    prefix: $("prefix").value.trim() || "ep",
+    episodes_dir: $("episodesdir").value.trim() || "episodes",
+    dry_run: $("dryrun").checked,
+    // Teleop holds the bridge open for the whole sitting, and the bridge sizes
+    // its RAM buffer from this, so it is bounded rather than open-ended.
+    teleop_duration: 600,
   };
-  if ($("savedir").value.trim()) o.save_dir = $("savedir").value.trim();
-  if ($("task").value.trim()) o.task_description = $("task").value.trim();
-  return o;
 }
 
 const open = (mode) => cmd("open_session", {

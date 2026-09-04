@@ -1,145 +1,152 @@
 # Collection GUI
 
-An operator panel for single-arm RLinf data collection: camera previews, arm
-restore, session and episode control, teleop-only mode, and F3-gated recording
-that lands in LeRobot format.
+An operator panel over this repo's own collection path: camera previews, arm
+restore, session and episode control, teleop-only mode, and F3-gated recording.
 
 ```bash
-python -m gui.selftest          # 29 checks, no hardware, no RLinf
-python -m gui.app --mock        # the interface, against a fake rig
+python -m gui.selftest            # 59 checks, no hardware
+python -m gui.app --mock          # the interface, against a fake rig
+
+.venv/bin/python -m gui.app       # the real thing, on the robot PC
 ```
 
-## Why it is shaped this way
+It supervises `bin/pnp7_teleop` and `collect/record_cameras.py` — the same
+processes `scripts/collect_episode.sh` runs, in the same order — with the
+operator deciding where each take starts and ends. Nothing touches the robot
+until a session is opened.
 
-**The GUI runs inside the RLinf worker.** Not beside it, not as a supervisor
-that shells out to `collect_data.sh`. That is forced, not chosen:
+## Why supervision, not integration
 
-- Every device admits exactly one owner. `RealSenseCamera.__init__` calls
-  `pipeline.start()`, franky holds the FCI control connection, and the GELLO
-  leader is a serial port. A second process could only ever watch.
-- RLinf's realworld stack cannot run without Ray. `FrankaEnv._setup_hardware`
-  asserts `isinstance(self.hardware_info, FrankaHWInfo)`, so `worker_info=None`
-  fails outright, and `FrankyController.launch_controller` spawns the arm
-  controller as a Ray actor.
+Everything here is already a separate process, so running them is the natural
+fit rather than a workaround. Three properties of the bridge shape the whole
+design, and all three are easy to get wrong:
 
-So there is one process, it holds everything, and the GUI lives in it.
-`gui.collect_gui` is `examples/embodiment/collect_real_data.py` with the fixed
-`while success_cnt < target` loop replaced by an operator.
-
-**A browser, not a native window.** This repo already documents the cost of the
-alternative: `scripts/collect_episode.sh` has to export `DISPLAY` and
-`XAUTHORITY=/run/user/1000/gdm/Xauthority` to get a cv2 window up, and RLinf's
-own `VideoPlayer` silently disables itself when `DISPLAY` is unset. A browser
-also puts the preview on a laptop next to the rig rather than on the robot PC's
-monitor. The server is `http.server` plus `cv2.imencode` — no web framework, so
-nothing new is installed into the environment that has to keep working.
-
-## Nothing in RLinf is modified
-
-Three seams, all public by construction:
-
-| Seam | Used for |
+| Property | Consequence |
 |---|---|
-| `CollectEpisode` honours `pre_record` / `record_reset` / `segment_advance` from `info` | F3 clipping (`gui/episode_control.py`) |
-| `FrankaEnv.camera_player` is a plain attribute assigned after the cameras open | previews, by swapping in a capture shim |
-| `FrankyController.reset_joint` | restoring the start pose |
+| The log lives in RAM until the process exits — `rows(duration * 1100)` allocated up front, `writeLog` called once at the end | **Never `SIGKILL`.** Stopping is always SIGINT, which decelerates the arm to rest, writes the CSV, and exits. A kill destroys the entire take. |
+| SIGINT and a completed run both exit 0 | Completion is judged by row count, never by exit status |
+| Nothing in the bridge ever flushes stdout | Over a pipe it is 4 KB block-buffered, so `CONTROL_READY` may never arrive. Readiness is the **status file** appearing instead |
 
-That matters because the single-arm Franky/GELLO branch is headed for an
-upstream RLinf PR. A GUI-driven collector is rig-specific, so it lives here and
-the upstream diff stays about the robot.
+That last one is lucky rather than clever: `runRobot` already publishes a JSON
+status file at 10 Hz via write-tmp-then-rename, and deletes it on a clean exit.
+So its appearance is the readiness signal, its content is the live telemetry,
+and its disappearance is the crash signal. `collect/view_cameras.py --status`
+has been reading the same file all along.
 
-## F3 does two jobs
+## Clipping happens downstream, and that is the point
 
-It is already the GELLO deadman — hold-to-enable absolute streaming. The GUI
-makes it the recording gate too:
+There is no clipping code in this GUI. `deadman` is a column in `teleop.csv`,
+and `build_episode.py` drops the released rows when it joins the streams. So
+what counts as demonstration stays a pure function of data already on disk:
+change your mind about the policy and re-run `build_episode.py`, months later,
+with the robot switched off.
 
-```
-pre_record = not (episode_open and gello_deadman_held)
-```
+The self-test demonstrates this rather than asserting it — a stubbed take with
+the pedal released in the middle comes out of the *real* `build_episode.py` with
+the idle frames dropped and counted in `episode_meta.json`.
 
-`GelloJointIntervention` already publishes `info["gello_deadman_held"]` every
-step, so nothing opens the pedal a second time. `CollectEpisode` then drops
-released-pedal frames before they reach the buffer — the same thing
-`build_episode.py` does for the old C++ pipeline.
+## The C++ change
 
-Each held interval gets its own `segment_id`, written per frame into the LeRobot
-episode. This is worth knowing when training: the arm pose *is* continuous
-across a pedal gap — the stream holds at the measured position while F3 is up,
-and re-engagement is refused unless GELLO and Franka agree within
-`startup_max_error` — but wall-clock time is not. The seams are marked so a
-training pipeline can honour them or ignore them, rather than having to guess
-where they were.
+One new mode, `pnp7_teleop home <config>`, because relative joint mapping has no
+notion of an absolute pose: after a session the arm is wherever the operator
+left it. It drives to `home_qpos` on a quintic profile — zero velocity *and*
+acceleration at both ends, which matters because libfranka rejects a motion that
+finishes moving. A SIGINT decays the time-scaling to zero over 0.3 s rather than
+stopping dead, for the same reason.
 
-## What the shipped config does today
+The duration comes from the config's own `max_joint_velocity` /
+`max_joint_acceleration`, inverting the quintic's peak coefficients (1.875·d/T
+and 5.7735·d/T²). That is deliberately conservative: at the stock 0.3 rad/s a
+3.5 rad move takes ~22 s. Raise `max_joint_velocity` if that is tedious — the
+compiled ceiling of 0.60 rad/s still applies.
 
-`realworld_collect_data_gello_franky.yaml` has no operator-driven episode
-boundary, and this is the gap the GUI closes. As it stands:
+`home_qpos` comes from `calibration.json`'s `franka_rest_pose`, emitted by
+`calib/make_teleop_config.py`. **Configs generated before this change do not
+have it, and `home` refuses to run without it** — regenerate, rather than
+guessing a pose nobody chose.
 
-- no `keyboard_reward_wrapper`, so `manual_done` is never set;
-- `max_episode_steps: 300`, so every take is a fixed 30 s at 10 Hz;
-- `only_success: True`, and without a reward model the reward is TCP proximity
-  to a fixed `target_ee_pose` — a SERL-style reaching check, unrelated to a
-  pick-and-place demonstration.
+`runDry` also gained a status publisher, so a dry session shows the same
+telemetry as a live one instead of looking like a bridge that failed to start.
 
-So takes would be cut at 30 seconds and then kept or dropped by a proximity test
-that has nothing to do with the task. The GUI sets `max_episode_steps: null` and
-`manual_episode_control_only: true` — RLinf's own spelling for "an external
-wrapper owns the episode end" — and passes `only_success=False`, because an
-episode the operator chose to keep is the success signal.
+## Camera recorder changes
 
-## Running it on the rig
+Two additive flags; without them the behaviour is unchanged bit for bit, so
+`collect_episode.sh` is unaffected.
 
-```bash
-cd ~/workspace/andyls/RLinf
-export EMBODIED_PATH=$PWD/examples/embodiment
-export PYTHONPATH=$PWD:$HOME/workspace/andyls/pnp7-lead-teleop:$PYTHONPATH
-
-python -m gui.collect_gui \
-    --config-path $EMBODIED_PATH/config \
-    --config-name realworld_collect_data_gello_franky \
-    runner.logger.log_path=$PWD/logs/gui
-```
-
-Binds `127.0.0.1:8770`. To drive it from a laptop pass `gui.host=0.0.0.0` and
-use the token it prints — the page commands a 7-DoF arm, so reaching it from
-another machine should take a secret and not just the right IP.
-
-Nothing touches the robot until you press **Open**. The env, and with it the FCI
-connection and the RealSense pipelines, is built then.
+- `--preview-dir DIR` — publish the latest frame per camera as `<role>.jpg` at
+  ~10 Hz, written to a temp name and renamed into place. Taps frames already
+  captured, so there is no extra camera load. This is how the browser sees the
+  scene: every RealSense pipeline is exclusive, so nothing else can open them.
+- `--no-write` — hold the cameras and record nothing. A viewfinder for framing
+  the scene between takes.
 
 ## Operator flow
 
 | Step | Notes |
 |---|---|
-| Open collect / teleop only | teleop-only constructs no writer at all, so nothing *can* be written |
-| Restore start joints | refused while F3 is held or an episode is open — the move would otherwise be recorded as demonstration |
-| Start episode | `s` |
-| Hold F3 | only these frames are kept; release and re-press opens a new segment |
-| Stop & keep / Discard | `e` / `x` |
-| Finalize LeRobot metadata | writes `info.json` / `stats.json`; until it runs the shard is on disk but not loadable |
+| Open collect / teleop only | starts the viewfinder; teleop runs the bridge with no log path, so nothing *can* be written |
+| Restore start joints | refused while an episode is open, and refused by the bridge itself if F3 is held |
+| Start episode | `s` — viewfinder stops, recorder starts, then the bridge once the cameras are ready |
+| Hold F3 | only these frames survive `build_episode.py` |
+| Stop & keep / Discard | `e` / `x` — SIGINT to the bridge, then build + validate. Discard actually deletes the directory |
+| Re-validate all episodes | runs `validate_episode.py` across the directory |
+
+**Release F3 before starting a take.** A pedal already held when the bridge
+starts is latched out until released once, and the bridge reports that
+identically to not pressing at all — the arm simply will not move and nothing
+says why.
 
 ## Known limitations
 
-- **No preview before a session.** The env claims the RealSense pipelines
-  exclusively, and releasing them cleanly enough for pyrealsense2 to re-open is
-  not reliable. Open a teleop-only session to frame the scene.
-- **The config *file* is fixed at launch.** Hydra composes at process start, so
-  switching files means relaunching. The GUI varies parameters within the
-  launched config, which is what actually changes between takes.
-- **Preview rate follows the env**, not `collect/record_cameras.py`. RLinf's
-  `BaseCamera._capture_frames` sleeps `1/fps` and *then* reads, so the effective
-  rate sits below the nominal `CameraInfo.fps` (default 15).
+- **The arm is dead between takes.** The bridge only runs during an episode, so
+  repositioning outside one means `home`. This matches what
+  `collect_episode.sh` has always done; a session-long bridge would cost ~1 GB
+  of RAM for half an hour and lose everything on a crash.
+- **Live counters are seconds, not frames.** The bridge publishes no frame
+  count, so the panel integrates pedal state at 10 Hz. `episode_meta.json`
+  replaces this with the exact number the moment the take is built.
+- **Teleop sittings are bounded** (default 600 s) because the bridge sizes its
+  RAM buffer from the duration. It is not auto-restarted: a restart while F3 was
+  held would silently latch the pedal out.
+- **Event camera is not covered** — equivalent to `EVENTS=0`. `event_camera/` is
+  a separate subsystem whose container runs a manual copy of the code.
+
+## LeRobot
+
+`collect/export_lerobot.py` converts built episodes, offline, in the RLinf
+environment (this repo's `.venv` has neither `lerobot` nor `torch`):
+
+```bash
+export PYTHONPATH=$HOME/workspace/andyls/RLinf:$PYTHONPATH
+$RLINF_PYTHON collect/export_lerobot.py episodes/ \
+    --out ~/datasets/pnp7_lerobot --task "pick the block and place it in the bin"
+```
+
+It reuses RLinf's `LeRobotDatasetWriter` rather than reimplementing the format —
+that class depends only on a compat shim and a logger, so it lifts out of the
+framework cleanly. `state` and `actions` are both 8-dimensional: seven joints
+plus the gripper, measured for state and commanded (`q_command`) for actions,
+because the roadmap is emphatic that the training action is never the raw lead
+arm.
+
+Each F3 interval is recorded in a per-frame `segment_id`; `--split-segments`
+emits them as separate LeRobot episodes instead, if you would rather the seams
+be impossible to cross. `--dry-run` reports what would be written.
 
 ## Files
 
 ```
 session.py         state machine, backend contract, control loop
-episode_control.py the gym wrapper that turns F3 into pre_record/segment_id
-rlinf_backend.py   the real rig, inside the Ray worker
-mock.py            a fake rig, for developing off the robot PC
+legacy_backend.py  supervises the bridge and the recorder
+mock.py            a fake rig, for working off the robot PC
 server.py          stdlib HTTP: JSON state, MJPEG previews, command queue
 static/index.html  the panel
-app.py             standalone mock entrypoint
-collect_gui.py     hydra + Ray entrypoint for the rig
-selftest.py        29 offline checks, including the F3 clipping arithmetic
+app.py             entrypoint, --mock or real
+selftest.py        59 offline checks
+stubs/             test doubles for the bridge and the camera recorder
 ```
+
+The stubs are what let the self-test run the *real* `build_episode.py` and
+`validate_episode.py` on a laptop: only the two hardware-facing processes are
+stand-ins, so the join, the clipping and the validation are all exercised for
+real.

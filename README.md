@@ -259,6 +259,7 @@ conservative than them.
 ```bash
 ./build.sh
 ./bin/pnp7_teleop selftest conf/pnp7_teleop.conf          # offline, 10 checks
+./bin/pnp7_teleop home     conf/pnp7_teleop.conf          # drive to home_qpos
 ./bin/pnp7_teleop dry      conf/pnp7_teleop.conf 30 dry.csv   # hardware, no robot
 ./bin/pnp7_teleop robot    conf/pnp7_teleop.conf 60 run.csv   # live
 ```
@@ -276,6 +277,12 @@ DURATION=60 CONF=conf/full50g.conf scripts/collect_episode.sh episodes/ep001
 Starts both cameras, waits for `CAMERAS_READY` (auto-exposure needs to settle
 before frames are worth training on), runs the bridge, then joins everything.
 `MODE=dry` exercises the whole path without commanding the robot.
+
+`gui/` runs the same sequence from a browser instead, with the operator deciding
+where each take starts and ends rather than passing a duration up front. It also
+owns the cleanup the shell script only prints: `set -euo pipefail` makes
+`collect_episode.sh`'s `BRIDGE_RC` unreachable, and its early exits leave the
+camera recorder orphaned holding both RealSense pipelines. See `gui/README.md`.
 
 Output per episode:
 
@@ -345,7 +352,9 @@ src/pnp7_teleop.cpp                      the realtime bridge
 pnp7/lead.py                             lead-arm driver (the only shared module)
 scripts/                                 collect_episode.sh, collect_batch.sh
 calib/                                   calibration, config generation, drift checks
-collect/                                 recording, episode building, validation, viewer
+collect/                                 recording, episode building, validation,
+                                         viewer, LeRobot export
+gui/                                     browser operator panel over the above
 diag/                                    diagnostics, benchmarks, bus tuning, bring-up probes
 deadman/                                 button identification and the udev rule
 event_camera/                            EVK4 tooling (separate subsystem)
@@ -392,6 +401,8 @@ copy is refreshed.
 | `collect/validate_episode.py` | Checks a collected episode is fit to train on | none |
 | `collect/prune_episode.py` | Reclaim space from a validated episode | none |
 | `collect/view_cameras.py` | Both RealSense streams on the robot screen | none |
+| `collect/export_lerobot.py` | Built episodes -> LeRobot, offline; needs the RLinf env | none |
+| `gui/app.py` | Operator panel: previews, episode control, arm restore | commands the arm |
 | `diag/analyze_run.py` | Validates a run against its configured limits | none |
 | `diag/monitor.py` | Live 8-servo read-out with per-joint travel ranges | read-only |
 | `diag/diag_gripper.py` | Measures real hand reaction latency from a log | none |

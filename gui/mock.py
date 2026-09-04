@@ -1,9 +1,9 @@
 """A backend that runs anywhere, so the UI can be built without the rig.
 
-None of the real imports resolve on a laptop -- pyrealsense2, franky, evdev and
-ray are all Linux-and-hardware -- and the robot PC is not a place to iterate on
-CSS. This stands in for all of it: two synthetic camera streams, a seven-joint
-arm that drifts plausibly, and an F3 pedal the browser can toggle.
+The real backend supervises a libfranka binary and a pyrealsense2 recorder,
+neither of which exists on a laptop, and the robot PC is not a place to iterate
+on CSS. This stands in for both: two synthetic camera streams, a seven-joint arm
+that drifts plausibly, and an F3 pedal the browser can toggle.
 
 It is not a simulator. It exists to exercise the state machine, the command
 plumbing and the MJPEG path, and to make the F3-clipping arithmetic testable
@@ -62,16 +62,18 @@ class MockBackend(Backend):
 
     def open_session(self, config_name: str, overrides: dict[str, Any],
                      mode: Mode) -> None:
-        # The real backend spends several seconds here building the env and
-        # running the GELLO alignment check; make that visible in the UI.
+        # The real backend spends a second or two here waiting for the
+        # cameras to settle before declaring themselves ready; make the wait
+        # visible in the UI rather than pretending it is instant.
         time.sleep(1.0)
         self._open = True
         self.camera_names = ["external", "wrist"]
         self._t0 = time.monotonic()
         self._episodes_kept = 0
+        # Same override names the real backend takes, so the panel drives both.
         self._dataset_dir = str(
-            overrides.get("save_dir")
-            or f"/tmp/mock_collect/{config_name}/collected_data")
+            overrides.get("episodes_dir")
+            or f"/tmp/mock_collect/{config_name}/episodes")
 
     def close_session(self) -> None:
         self._open = False
@@ -104,7 +106,7 @@ class MockBackend(Backend):
             "deadman_held": self.deadman_held,
             "stream_enabled": self.deadman_held,
             "block_reason": None if self.deadman_held else "deadman_released",
-            "alignment_error": 0.012,
+            "lead_age_ms": 1.1,
             "joints": list(self._qpos),
             "gripper_width": self._gripper,
             "episode_steps": self._steps,
@@ -181,5 +183,5 @@ class MockBackend(Backend):
     def list_configs(self) -> list[dict[str, Any]]:
         if self.config_dir and self.config_dir.is_dir():
             return [{"name": p.stem, "path": str(p)}
-                    for p in sorted(self.config_dir.glob("*.yaml"))]
-        return [{"name": "realworld_collect_data_gello_franky", "path": "(mock)"}]
+                    for p in sorted(self.config_dir.glob("*.conf"))]
+        return [{"name": "full50b", "path": "(mock)"}]

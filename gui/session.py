@@ -1,13 +1,14 @@
 """State machine and backend contract for the collection GUI.
 
-Every piece of hardware on this rig is claimed exclusively by whoever opens it
-first -- ``RealSenseCamera`` calls ``pipeline.start()``, franky holds the FCI
-control connection, and the GELLO leader is a serial port. A GUI that pokes the
-hardware from its own process would therefore fight the collection run for it.
-So the GUI does not own hardware at all: it owns a *session*, and the session
-owns the env. One process, one claim on each device.
+The GUI owns no hardware. It owns a *session*, and the session decides which
+processes are running: `bin/pnp7_teleop` for the arm, `collect/record_cameras.py`
+for the two RealSense streams. Every device on this rig is claimed exclusively
+by whoever opens it first, so the state machine's real job is making sure only
+one thing holds each at a time -- the viewfinder must let go of the cameras
+before a take can record them, and the bridge must have exited before `home` can
+take the FCI connection.
 
-The state machine below is the whole contract between the browser and that
+The state machine below is the whole contract between the browser and this
 process. The server translates HTTP into `Command`s and renders `SessionState`
 back out as JSON; the backend is whatever actually moves.
 """
@@ -64,10 +65,10 @@ class Mode(str, Enum):
 class Command:
     """One operator action, queued for the control loop.
 
-    The browser never touches the env directly. It appends a Command, the
-    control loop applies it between steps, and the result shows up in the next
-    `SessionState`. That keeps every env call on one thread, which franky and
-    pyrealsense2 both require in practice.
+    The browser never starts or stops a process directly. It appends a Command,
+    the control loop applies it between polls, and the result shows up in the
+    next `SessionState`. That keeps process lifecycle on one thread, so two
+    clicks can never race over who owns the cameras.
     """
 
     name: str
@@ -91,7 +92,10 @@ class SessionState:
     deadman_held: bool = False
     stream_enabled: bool = False
     block_reason: str | None = None
-    alignment_error: float | None = None
+    #: Age of the newest lead-arm sample, from the bridge's status file.
+    #: The bridge disengages when this exceeds `watchdog_ms`, so a rising
+    #: value is the early warning for a bus going quiet.
+    lead_age_ms: float | None = None
     joints: list[float] = field(default_factory=list)
     gripper_width: float | None = None
 
@@ -119,7 +123,7 @@ class SessionState:
             "deadman_held": self.deadman_held,
             "stream_enabled": self.stream_enabled,
             "block_reason": self.block_reason,
-            "alignment_error": self.alignment_error,
+            "lead_age_ms": self.lead_age_ms,
             "joints": [round(float(q), 5) for q in self.joints],
             "gripper_width": self.gripper_width,
             "episode_index": self.episode_index,
@@ -139,11 +143,11 @@ class SessionState:
 class Backend:
     """What the control loop needs from the world.
 
-    Two implementations: `gui.mock.MockBackend`, which runs anywhere and is what
-    the UI is developed and tested against, and `gui.rlinf_backend.RlinfBackend`,
-    which drives the real single-arm RLinf stack on the robot PC. Keeping the
-    seam here is what makes the GUI testable off the rig at all -- none of the
-    hardware imports (pyrealsense2, franky, evdev, ray) resolve on a laptop.
+    Two implementations: `gui.legacy_backend.LegacyBackend`, which supervises the
+    bridge and the camera recorder on the robot PC, and `gui.mock.MockBackend`,
+    which fakes both so the interface can be worked on anywhere. The seam is what
+    makes the panel developable off the rig -- neither libfranka nor
+    pyrealsense2 exists on a laptop.
     """
 
     #: Camera names available from `latest_frame`, once opened.
@@ -198,6 +202,15 @@ class Backend:
     def latest_frame(self, camera: str) -> np.ndarray | None:
         raise NotImplementedError
 
+    def latest_jpeg(self, camera: str) -> bytes | None:
+        """Already-encoded preview, when the backend has one.
+
+        The C++ path's recorder writes JPEGs to a directory, so serving them
+        verbatim avoids decoding and re-encoding every frame on the way to the
+        browser. Backends that only hold raw arrays leave this alone.
+        """
+        return None
+
     def list_configs(self) -> list[dict[str, Any]]:
         raise NotImplementedError
 
@@ -205,9 +218,10 @@ class Backend:
 class ControlLoop:
     """Owns the backend, applies queued commands, and steps at a fixed rate.
 
-    One thread, because that is the only safe arrangement: franky's controller
-    handle, the RealSense pipelines and the GELLO serial port are all opened
-    here and must be touched from the same thread that opened them.
+    One thread, so that starting and stopping children is serialised. Two
+    commands arriving together must not both decide to launch a camera
+    recorder: the second would fail on a device the first already holds, with a
+    pyrealsense2 error that says nothing useful about why.
     """
 
     def __init__(self, backend: Backend, fps: float = 10.0,
@@ -289,6 +303,13 @@ class ControlLoop:
                 if hasattr(self.state, key):
                     setattr(self.state, key, value)
             self.state.uptime_s = time.monotonic() - self._t_open
+
+        # A backend that runs its recording on a fixed duration (the C++ bridge
+        # is given one on the command line) reports the take reaching its end.
+        # Close it the same way the operator would, so the episode is built and
+        # kept rather than being torn down as a fault.
+        if telemetry.get("episode_finished") and self.state.phase is Phase.RECORDING:
+            self.submit("end_episode")
 
     def _drain_commands(self) -> None:
         with self._lock:
