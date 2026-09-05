@@ -130,41 +130,90 @@ takeover without starting the bridge.
 ## libfranka version
 
 **2026-09: the arm's firmware was upgraded past FR3 System Version 5.9.0, and
-libfranka 0.15.0 no longer connects.** The bridge will not run until libfranka
-is rebuilt.
+libfranka 0.15.0 stopped connecting.** Rebuilt at **0.21.3**, which is what
+`bin/pnp7_teleop` now links against.
 
-libfranka pins itself to a minimum firmware: 0.15.0 declares `>= 5.7.2`, and
-0.18.0 declares `>= 5.9.0`. Once the robot crossed 5.9.0, everything below
-0.18.0 is out.
+libfranka pins a minimum firmware per release: 0.15.0 declares `>= 5.7.2`,
+0.18.0 declares `>= 5.9.0`. Once the robot crossed 5.9.0 everything below 0.18.0
+was out. Of what remained, **0.20.0 is the floor worth taking**: 0.18.0 changed
+`RobotState` to float-based fields, which breaks every place the bridge assigns
+`robot_state.q` (and `dq`, `tau_J`, `O_T_EE`, `O_F_ext_hat_K`) straight into a
+`std::array<double, 7>` -- about thirteen of them. 0.20.0 reverted that, so on
+0.20+ they compile untouched.
 
-**Rebuild at 0.20.0 or newer -- not 0.18.** 0.18.0 changed `RobotState` to
-float-based fields, which breaks every one of the ~13 places
-`src/pnp7_teleop.cpp` assigns `robot_state.q` (and `dq`, `tau_J`, `O_T_EE`,
-`O_F_ext_hat_K`) straight into a `std::array<double, 7>`. 0.20.0 reverted that
-change -- "reverting the float change within the robot state back to doubles" --
-so on 0.20+ those lines compile unchanged. Choosing 0.18 or 0.19 means adding
-conversions in all of them for no benefit.
-
-Nothing else the bridge uses is touched: `Robot::control`, `JointPositions`,
-`RobotMode`, `RobotState::current_errors`, `Gripper` and `Duration` have no
-changelog entries across 0.15 -> 0.21. The one 0.18 deprecation that could have
+Nothing else the bridge uses changed across 0.15 -> 0.21: `Robot::control`,
+`JointPositions`, `RobotMode`, `RobotState::current_errors`, `Gripper` and
+`Duration` have no changelog entries. The one 0.18 deprecation that could have
 applied -- `computeUpperLimitsJointVelocity` / `computeLowerLimitsJointVelocity`
--- was reached through `<franka/rate_limiting.h>`, which was included but never
-used; the include has been dropped.
+-- came in through `<franka/rate_limiting.h>`, which was included but never
+referenced; that include has been dropped.
 
-Two things to check after rebuilding, neither of them a code change yet:
+### Rebuilding it
 
-- **`build.sh` linking.** 0.18.0 moved to static linking. The script passes
-  `-L$LIBFRANKA/build -lfranka -Wl,-rpath,...`; with a static `libfranka.a` the
-  rpath is inert but harmless. Confirm `ldd bin/pnp7_teleop` looks sane.
+Built **beside** the 0.15.0 tree rather than over it, so nothing else that links
+against 0.15 changes and reverting is a matter of not setting `LIBFRANKA`:
+
+```bash
+git clone --recursive --branch 0.21.3 --depth 1 \
+    https://github.com/frankarobotics/libfranka.git ~/catkin_franka/libfranka-0.21.3
+cd ~/catkin_franka/libfranka-0.21.3
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+    -DCMAKE_PREFIX_PATH=/opt/openrobots        # <- pinocchio lives here
+cmake --build build -j"$(nproc)"
+
+cd ~/workspace/andyls/pnp7-lead-teleop
+LIBFRANKA=$HOME/catkin_franka/libfranka-0.21.3 ./build.sh
+```
+
+`-DCMAKE_PREFIX_PATH=/opt/openrobots` is the whole trick. **libfranka 0.20+ adds
+a hard, unguarded `find_package(pinocchio REQUIRED)`** -- there is no option to
+turn it off, even though this bridge never touches `franka::Model`. pinocchio
+3.4.0 is already installed on the robot PC from robotpkg, but it lives under
+`/opt/openrobots`, which CMake does not search by default, so the configure step
+fails with a bare "could not find pinocchio" that reads like a missing package.
+Nothing needs installing; it only needs pointing at.
+
+The rest of the toolchain clears the bar without help: 0.21.3 asks for CMake
+>= 3.16 and C++17, and the robot PC has 3.16.3 and g++ 9.4.0 on Ubuntu 20.04.
+Eigen 3.3.7 and Poco 1.9.2 are the system ones; `fmt` is fetched at configure
+time, so the machine needs network access for that step.
+
+### Why not conda-forge / pixi
+
+`libfranka` is on conda-forge, up to 0.21.3, and installing a prebuilt one is a
+reasonable instinct -- it just does not fit here. The conda build targets a
+different dependency stack from this machine's:
+
+| | conda-forge 0.21.3 | this robot PC |
+|---|---|---|
+| libstdc++ | `>= 14` | g++ 9.4, GLIBCXX_3.4.28 |
+| Eigen | `eigen-abi >= 5.0.1` | 3.3.7 |
+| Poco | `>= 1.15.3` | 1.9.2 |
+| pinocchio | `>= 4.1.0` | 3.4.0 |
+
+Taking it would mean compiling the bridge inside the environment with
+conda's `gxx` against conda's Eigen and Poco, and rebuilding `DynamixelSDK`
+there too -- a toolchain migration under a 1 kHz realtime control loop whose
+timing is measured and recorded in this file, in exchange for skipping a
+two-minute compile. The source build links against exactly the same system
+Eigen and Poco that `build.sh` compiles the bridge against, which is the
+property worth keeping.
+
+(pixi would earn its place on the *Python* side instead -- specifically the
+LeRobot export, which needs `lerobot` and `torch` from the RLinf environment and
+currently has no reproducible definition at all. See `gui/README.md`.)
+
+### Still to check on the robot
+
 - **The hardcoded joint limits.** `kQMin` / `kQMax` in `src/pnp7_teleop.cpp` are
   commented "Franka Panda joint limits" and carry Panda's numbers. FR3's
   envelope differs -- most visibly on J6, where Panda allows roughly -1 deg and
-  FR3 starts at about +25 deg -- and FR3's envelope was itself widened at system
-  5.9.0. The compiled ceiling is therefore no longer guaranteed to be the more
-  conservative of the two. This has not bitten because the calibration posture
-  keeps J6 near 173 deg, but it should be checked against the firmware actually
-  installed rather than against a datasheet.
+  FR3 starts near +25 deg -- and FR3's envelope was itself widened at system
+  5.9.0. So the compiled ceiling can no longer be assumed to be the more
+  conservative of the two. It has not bitten because the calibration posture
+  keeps J6 near 173 deg, but it should be read off the installed firmware rather
+  than off a datasheet.
 
 ## Setting up a checkout
 
@@ -174,12 +223,13 @@ tree. A fresh checkout is therefore source only, and `demo.sh` fails on its
 first line with no `.venv/bin/python`. This is what happened when the working
 copy moved to `~/workspace/andyls/pnp7-lead-teleop`; the recovery is below.
 
-Already present on the robot PC, and not rebuilt by any of this:
+Already present on the robot PC:
 
 | | |
 |---|---|
-| libfranka | built at `~/catkin_franka/libfranka` -- version now constrained, see below |
-| Eigen | `/usr/include/eigen3` |
+| libfranka | 0.21.3 at `~/catkin_franka/libfranka-0.21.3` -- see "libfranka version" above. The old 0.15.0 tree is still at `~/catkin_franka/libfranka` and is no longer usable |
+| pinocchio | 3.4.0 under `/opt/openrobots` (robotpkg); libfranka 0.20+ requires it |
+| Eigen | `/usr/include/eigen3` (3.3.7) |
 | `uv` | `/usr/bin/uv` |
 
 ```bash
@@ -196,8 +246,9 @@ uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 uv pip install --python .venv/bin/python -e .
 
-# 3. The bridge.
-./build.sh
+# 3. The bridge. LIBFRANKA is required now that the default path holds the
+#    unusable 0.15.0 build -- see "libfranka version" above.
+LIBFRANKA=$HOME/catkin_franka/libfranka-0.21.3 ./build.sh
 ```
 
 `build.sh` takes `LIBFRANKA` and `DXL` from the environment, so a machine that
