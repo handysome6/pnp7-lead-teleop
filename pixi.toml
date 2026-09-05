@@ -1,0 +1,98 @@
+# Reproducible environment for the PNP-7 teleop stack on a fresh controller PC
+# (robot-s0). This is the first lockfile the C++ side of this project has had.
+#
+# The original robot PC builds libfranka from source against Ubuntu 20.04's
+# system Eigen and Poco, and README.md's "Why not conda-forge / pixi" explains
+# why. That argument is about *that* machine's pre-existing stack, and none of
+# it transfers to a bare box: nothing is commissioned yet, there is no stack to
+# stay ABI-consistent with, and pinocchio is not "already installed" -- from
+# scratch it is a robotpkg apt repo plus root, where conda-forge hands it over
+# as a dependency of libfranka for free.
+#
+# The rule this file follows is take the WHOLE environment, not half of it.
+# conda-forge's libfranka 0.21.3 wants libstdc++ >= 14, Eigen 5 and Poco 1.15,
+# so the compiler comes from here too, and the vendored DynamixelSDK is built
+# with that same compiler -- the bridge links libdxl_x64_cpp.so, and a DXL
+# built by the system gcc would reintroduce exactly the split the source build
+# on the robot PC exists to avoid.
+#
+#   pixi install                 # solve + materialise the env, writes pixi.lock
+#   pixi run setup               # DynamixelSDK + bridge, from a bare checkout
+#   pixi run selftest            # offline, expect SELFTEST_OK / 11 checks
+#   pixi run check-ready         # needs the lead arm and cameras attached
+
+[workspace]
+name = "pnp7-lead-teleop"
+version = "0.1.0"
+channels = ["conda-forge"]
+# linux-64 only, deliberately. The bridge includes <linux/input.h> for the
+# dead-man evdev grab and libfranka is Linux-only, so there is nothing a laptop
+# platform could resolve -- the Mac checkout is for editing and git, not builds.
+platforms = ["linux-64"]
+
+[dependencies]
+# --- C++ side -------------------------------------------------------------
+# gcc 14 rather than the newest available: 14 is the floor libfranka's
+# `libstdcxx >= 14` actually asks for, and the vendored DynamixelSDK is a 2023
+# tree that has no reason to survive gcc 16's stricter defaults.
+gxx = "14.*"
+make = "*"
+# libfranka pulls libpinocchio, poco, fmt and the eigen ABI itself. Pinned to
+# the version bin/pnp7_teleop is validated against on the robot PC -- see
+# "libfranka version" in README.md for why anything below 0.20 is out.
+libfranka = "0.21.3.*"
+# Headers, so the -I path exists. libfranka depends on `eigen-abi`, which is a
+# marker package and ships none.
+eigen = ">=5.0.1,<6"
+
+# --- Python side ----------------------------------------------------------
+python = "3.11.*"
+
+[pypi-dependencies]
+# Exactly the pins from requirements.txt, which are the versions the
+# commissioning record and the accepted episodes were produced with. opencv and
+# pyrealsense2 are binary wheels, so re-resolving them changes compiled code --
+# loosen a pin deliberately, then re-run check_ready.py and a dry run.
+numpy = "==2.4.6"
+opencv-python = "==5.0.0.93"
+pyrealsense2 = "==2.58.3.10794"
+pyserial = "==3.5"
+dynamixel-sdk = "==4.0.5"
+# Editable, and the reason `from pnp7.lead import ...` works from scripts that
+# live in subdirectories. Same role as the `uv pip install -e .` step in
+# README.md's "Setting up a checkout".
+pnp7 = { path = ".", editable = true }
+
+[tasks]
+# DynamixelSDK is a 43 MB vendored upstream tree, deliberately untracked.
+# 2ded684 is what this was commissioned on.
+dxl-fetch = { cmd = """
+  test -d DynamixelSDK/.git ||
+    (git clone https://github.com/ROBOTIS-GIT/DynamixelSDK.git &&
+     git -C DynamixelSDK checkout 2ded684)
+""" }
+
+# The SDK's Makefile hardcodes `CC = gcc`, `CX = g++` (its spelling for the C++
+# compiler) and, separately, `LD = g++` for the shared-library link. All three
+# have to be overridden: leaving LD alone would compile the objects with this
+# env's gcc 14 and then link libdxl_x64_cpp.so with /usr/bin/g++, which is the
+# half-migrated state this whole file exists to avoid.
+dxl-build = { cmd = "make -C DynamixelSDK/c++/build/linux64 CC=$CC CX=$CXX LD=$CXX", depends-on = ["dxl-fetch"] }
+
+# build.sh finds libfranka and Eigen under $CONDA_PREFIX on its own when no
+# LIBFRANKA is set, so this needs no arguments here.
+bridge = { cmd = "./build.sh", depends-on = ["dxl-build"] }
+
+setup = { depends-on = ["bridge"] }
+
+# The confirmation ladder from README.md: each step needs strictly more
+# hardware than the one above it, so the first failure names the broken layer.
+selftest = { cmd = "./bin/pnp7_teleop selftest conf/demo.conf", depends-on = ["bridge"] }
+check-ready = { cmd = "python check_ready.py --config conf/demo.conf" }
+dry = { cmd = "./bin/pnp7_teleop dry conf/demo.conf 10 /tmp/dry.csv", depends-on = ["bridge"] }
+
+[activation.env]
+# The SDK Makefile builds into build/linux64; the bridge is linked with an
+# rpath onto it, so nothing needs LD_LIBRARY_PATH at run time.
+CC = "$CONDA_PREFIX/bin/gcc"
+CXX = "$CONDA_PREFIX/bin/g++"

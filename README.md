@@ -179,11 +179,11 @@ The rest of the toolchain clears the bar without help: 0.21.3 asks for CMake
 Eigen 3.3.7 and Poco 1.9.2 are the system ones; `fmt` is fetched at configure
 time, so the machine needs network access for that step.
 
-### Why not conda-forge / pixi
+### Why not conda-forge / pixi *on this machine*
 
 `libfranka` is on conda-forge, up to 0.21.3, and installing a prebuilt one is a
-reasonable instinct -- it just does not fit here. The conda build targets a
-different dependency stack from this machine's:
+reasonable instinct -- it just does not fit this machine. The conda build
+targets a different dependency stack from this one's:
 
 | | conda-forge 0.21.3 | this robot PC |
 |---|---|---|
@@ -199,6 +199,10 @@ timing is measured and recorded in this file, in exchange for skipping a
 two-minute compile. The source build links against exactly the same system
 Eigen and Poco that `build.sh` compiles the bridge against, which is the
 property worth keeping.
+
+Every line of that argument is about this machine's *pre-existing state*, and
+none of it survives on a bare box -- which is why `robot-s0`, commissioned from
+nothing in 2026-09, does the exact opposite. See "Setting up robot-s0" below.
 
 (pixi would earn its place on the *Python* side instead -- specifically the
 LeRobot export, which needs `lerobot` and `torch` from the RLinf environment and
@@ -272,12 +276,106 @@ named 'serial'` row and then simply omits the torque and sample-rate gates. The
 result is an `overall: FAIL` that reads like an ordinary hardware fault while
 two of the four lead-arm checks never ran at all.
 
-### Syncing the two checkouts
+### Setting up robot-s0
 
-There are two working copies -- `~/workspace/vla_data_collect/pnp7-lead-teleop`
-on the laptop and `~/workspace/andyls/pnp7-lead-teleop` on the robot PC -- both
-tracking `github.com/handysome6/pnp7-lead-teleop`. They reach it over different
-protocols, for reasons that are not obvious from `git remote -v`:
+`robot-s0` (`ssh robot-s0`, `liushuai@192.168.1.104`) is the second controller
+PC, brought up from bare metal in 2026-09. It is set up the opposite way from
+the robot PC above: everything below the application code comes from
+conda-forge through `pixi`, and `pixi.lock` is the first reproducible
+definition the C++ side of this project has ever had.
+
+The argument in "Why not conda-forge / pixi" inverts point by point, because
+all of it was about the robot PC's pre-existing state:
+
+| The robot PC's reason | Why it does not hold on robot-s0 |
+|---|---|
+| pinocchio is already installed | It is not. From scratch that is a robotpkg apt repo plus root; conda-forge hands it over as a dependency of `libfranka` for free |
+| ABI consistency with the existing stack | There is no existing stack. The whole thing is chosen at once, which makes it *more* internally consistent than the robot PC, not less |
+| Do not migrate the toolchain under a measured 1 kHz loop | Nothing here is commissioned or characterised yet, so there is no measurement to disturb |
+| ...in exchange for skipping a two-minute compile | It is only two minutes because pinocchio was already there. From scratch it is apt repo setup, Poco/Eigen/cmake dev packages, then libfranka, then DynamixelSDK -- and most of it needs root, which this account does not have |
+
+The condition attached is **take the whole environment, not half of it**.
+conda-forge's libfranka 0.21.3 wants libstdc++ >= 14, Eigen 5 and Poco 1.15, so
+the bridge is compiled with the env's `gxx` *and DynamixelSDK is built there
+too*, since the bridge links `libdxl_x64_cpp.so`. A DXL built by the system
+compiler would reintroduce exactly the split the source build on the robot PC
+exists to avoid.
+
+That last point has a sharp edge worth naming: the SDK's Makefile sets `CC`,
+`CX` (its spelling for the C++ compiler) and, separately, `LD = g++` for the
+shared-library link. `pixi.toml`'s `dxl-build` task overrides all three.
+Overriding only the compilers compiles the objects in-env and then links the
+final `.so` with `/usr/bin/g++`, which looks like it worked.
+
+(In practice the bridge would probably survive mixing -- it only touches
+`Robot`, `RobotState`, `JointPositions`, `Duration` and `Gripper`, all plain
+`std::array`/POD across the API, with Eigen appearing only in `franka::Model`,
+which it never uses. But "the Eigen types happen not to cross the ABI boundary"
+is not a bet worth taking on a robot safety chain when building in-env is free.)
+
+From a bare checkout:
+
+```bash
+curl -fsSL https://pixi.sh/install.sh | bash     # -> ~/.pixi/bin, edits .bashrc
+cd ~/workspace/pnp7-lead-teleop
+pixi install         # solve + materialise, ~1.7 GB under .pixi/
+pixi run setup       # DynamixelSDK at 2ded684, built in-env, then the bridge
+pixi run selftest    # offline; expect SELFTEST_OK, 11 checks
+```
+
+`build.sh` needs no arguments there. An explicit `LIBFRANKA` still wins, so the
+robot PC's documented invocation is untouched; with none set it falls back to
+`$CONDA_PREFIX/include` + `$CONDA_PREFIX/lib` when it finds libfranka headers
+there, which is what `pixi run` supplies. `.pixi/` is ignored; `pixi.lock` is
+tracked, because it is the half that reproduces.
+
+What the environment pins:
+
+| | |
+|---|---|
+| libfranka | 0.21.3 from conda-forge, pulling libpinocchio 4.1.0, Poco 1.15.3, fmt 12.1 and the Eigen 5.0.1 ABI |
+| Compiler | conda-forge gcc 14.4.0 -- the floor `libstdcxx >= 14` actually asks for rather than the newest available, because the vendored DynamixelSDK is a 2023 tree with no reason to survive gcc 16's stricter defaults |
+| Python | 3.11, with the exact pins from `requirements.txt` and `pnp7` installed editable |
+
+`ldd bin/pnp7_teleop` resolves libfranka, libstdc++, libgcc_s, Poco, fmt and
+pinocchio inside `.pixi/envs/default`; only glibc's own libraries come from the
+system, which is as far as an unprivileged env can go.
+
+#### What is not commissioned on robot-s0 yet
+
+The *environment* is complete, and `check_ready.py` proves it the useful way:
+it runs every gate rather than quietly skipping the lead-arm ones the way the
+system `python3` does, so everything it reports is hardware. All of the gaps
+below need root, which this account does not have.
+
+| Gap | Effect | Fix |
+|---|---|---|
+| `ulimit -r` is 0 for `liushuai`. `/etc/security/limits.d/99-franka-raojiaji.conf` grants rtprio 99 to `raojiaji` only | libfranka's default `RealtimeConfig::kEnforce` refuses to start `robot` mode | add a `liushuai - rtprio 99` limits.d entry, then log out and back in |
+| Kernel is `6.8.0-138-generic`, PREEMPT_DYNAMIC -- not PREEMPT_RT. The robot PC runs `5.15.197-rt91` | the 1 kHz FCI loop has no realtime guarantee, so none of the timing recorded in this file carries over | install a PREEMPT_RT kernel before characterising anything |
+| `deadman/99-pnp7-lead.rules` is not installed, and no FT232H is on the USB bus | `/dev/pnp7_lead` and `/dev/pnp7_deadman` do not exist | plug the lead arm in, copy the rule into `/etc/udev/rules.d/`, `udevadm control --reload`, replug |
+| No librealsense udev rules; the D435i nodes are `crw-rw-r-- root root` | both cameras are on the bus (`lsusb` sees them) but `pyrealsense2` enumerates none | install `99-realsense-libusb.rules` |
+| `liushuai` is in neither `dialout` nor `plugdev` | serial and raw-USB access | add the groups, or let the udev rules above cover it |
+| FCI port 1337 refuses while ICMP to `172.16.0.2` succeeds | the arm is wired and reachable on `enp131s0` (172.16.0.1/24) but FCI is not active | enable FCI in Desk and release the brakes |
+
+One more thing to know about the host alias: `robot-s0` points at
+`192.168.1.104`, which is the *WiFi* interface (`wlx60a3e345f593`). The machine
+also has `192.168.0.4` on USB ethernet and `172.16.0.1` on the FCI NIC. If the
+WiFi lease moves, the alias moves with it -- unlike `pnp7`, which is pinned to a
+Tailscale address.
+
+### Syncing the checkouts
+
+There are three working copies, all tracking
+`github.com/handysome6/pnp7-lead-teleop`:
+
+| | |
+|---|---|
+| laptop | `~/workspace/vla_data_collect/pnp7-lead-teleop` |
+| robot PC | `~/workspace/andyls/pnp7-lead-teleop` |
+| robot-s0 | `~/workspace/pnp7-lead-teleop` |
+
+They reach the remote over different protocols, for reasons that are not
+obvious from `git remote -v`:
 
 - **Laptop: HTTPS.** Tailscale resolves `github.com` to `198.18.0.47` and closes
   port 22, so the `git@github.com:` form cannot connect. HTTPS works, using the
@@ -290,10 +388,16 @@ protocols, for reasons that are not obvious from `git remote -v`:
   `IdentitiesOnly yes`; that option is load-bearing, not decoration. Drop it and
   ssh offers the default key first, authenticates as `git-xuxin`, and the push
   is refused.
+- **robot-s0: HTTPS.** Nothing intercepts `github.com` there and the repo is
+  public, so a plain clone works with no key setup at all. A push will need
+  credentials; it has none yet.
 
 The robot PC also carries a repo-local `user.name` / `user.email`, because its
 global git identity belongs to another user of the same account. Without it,
-commits made at the robot are attributed to that person.
+commits made at the robot are attributed to that person. robot-s0 carries the
+same override for a nearer version of the same reason -- the `liushuai` account
+is shared, and its global git identity is simply unset, so commits made there
+would otherwise be attributed to `liushuai@robot-s0`.
 
 Check which identity a push will use with `ssh -T git@github-pnp7` -- it answers
 with the repo name for a deploy key, or a username for an account key.
@@ -346,9 +450,17 @@ conservative than them.
 
 ### Build and run
 
+On robot-s0 these run as written, with no `pixi run` in front: `build.sh`
+bakes an RPATH onto `.pixi/envs/default/lib`, so the binary finds libfranka and
+libstdc++ from a bare shell. The RPATH is absolute, though, which is the catch
+-- move or delete the env, or relocate the checkout, and the binary stops
+loading until `pixi run bridge` relinks it. The *Python* entry points
+(`check_ready.py`, everything under `collect/` and `calib/`) do need `pixi run`
+or `pixi shell`.
+
 ```bash
 ./build.sh
-./bin/pnp7_teleop selftest conf/pnp7_teleop.conf          # offline, 10 checks
+./bin/pnp7_teleop selftest conf/pnp7_teleop.conf          # offline, 11 checks
 ./bin/pnp7_teleop home     conf/pnp7_teleop.conf          # drive to home_qpos
 ./bin/pnp7_teleop dry      conf/pnp7_teleop.conf 30 dry.csv   # hardware, no robot
 ./bin/pnp7_teleop robot    conf/pnp7_teleop.conf 60 run.csv   # live
@@ -436,6 +548,7 @@ identify a servo bus. Grouped by what a file is *for*:
 
 ```
 build.sh  demo.sh  check_ready.py        the three entry points
+pixi.toml  pixi.lock                     robot-s0's whole environment, C++ included
 calibration.json                         live calibration, read by most tools
 conf/                                    12 teleop configs
 src/pnp7_teleop.cpp                      the realtime bridge
@@ -452,8 +565,9 @@ known_good/                              restorable snapshot, written by calib/s
 archive/                                 superseded configs and one-off patch scripts
 ```
 
-`pnp7/` is a real package installed editable into the venv, so `from pnp7.lead
-import ...` resolves no matter which subdirectory a script lives in. Python puts
+`pnp7/` is a real package installed editable -- into `.venv` on the robot PC,
+into the pixi env on robot-s0 -- so `from pnp7.lead import ...` resolves no
+matter which subdirectory a script lives in. Python puts
 the *script's* directory on `sys.path`, never the repo root, so without the
 install the eight importers would each need a `sys.path` shim.
 

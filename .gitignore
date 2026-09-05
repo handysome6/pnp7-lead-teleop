@@ -7,6 +7,9 @@ DynamixelSDK/
 # Build products and environments.
 bin/
 .venv/
+# pixi's materialised environment (several hundred MB of packages).
+# pixi.lock is tracked on purpose -- it is the reproducible half.
+.pixi/
 __pycache__/
 *.pyc
 *.so
