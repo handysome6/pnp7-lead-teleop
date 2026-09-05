@@ -8,7 +8,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-CONF="${CONF:-$REPO/conf/full50.conf}"
+CONF="${CONF:-$REPO/conf/full50b.conf}"
 DURATION="${DURATION:-60}"
 # MODE=dry exercises the whole pipeline without commanding the robot.
 MODE="${MODE:-robot}"

@@ -34,7 +34,7 @@ def bar(value: float, lo: float, hi: float) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/pnp7_lead")
+    ap.add_argument("--port", default="/dev/gello")
     ap.add_argument("--baud", type=int, default=1000000)
     ap.add_argument("--record", help="write every sample to this CSV")
     ap.add_argument("--hz", type=float, default=20.0, help="display refresh rate")

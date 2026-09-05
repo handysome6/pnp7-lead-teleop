@@ -8,12 +8,35 @@ python -m gui.selftest            # 59 checks, no hardware
 python -m gui.app --mock          # the interface, against a fake rig
 
 .venv/bin/python -m gui.app       # the real thing, on the robot PC
+pixi run python -m gui.app       # robot-s0, using its pixi environment
 ```
+
+Open `http://127.0.0.1:8770` on the controller. From a laptop, forward the
+loopback port with `ssh -N -L 8770:127.0.0.1:8770 robot-s0`, then open the same
+URL locally. The GUI and its Python subprocesses use the same interpreter.
+An idle page does not validate camera access, FCI connectivity, or foot-brake
+press/release behavior; those must be ready before opening a real session.
 
 It supervises `bin/pnp7_teleop` and `collect/record_cameras.py` — the same
 processes `scripts/collect_episode.sh` runs, in the same order — with the
 operator deciding where each take starts and ends. Nothing touches the robot
 until a session is opened.
+
+## Configuration choices
+
+The default menu contains **标准遥操** (`full100b.conf`, 1:1 mapping) and
+**半幅遥操** (`full50b.conf`, 0.5 gain), both with binary gripper control.
+Select **显示关节调试配置** to expose `j6only.conf` and `j7only.conf`
+(0.25 gain, gripper disabled). Configuration choices are locked while a
+session is open or a Home save is in progress. Saving Home changes only the
+selected file.
+
+`demo.conf` remains available to `demo.sh` but is excluded from the GUI menu.
+The old-posture configs `firstlive`, `full25`, `full50`, `full50g`, `j34`,
+`pnp7_teleop`, and `wrist` have been removed; they retained earlier joint
+signs. The collection shell script now defaults to `full50b.conf`.
+New, unclassified configs appear only under the debug toggle. Historical
+snapshots in `known_good/` and `archive/` are outside the GUI config directory.
 
 ## Why supervision, not integration
 
@@ -64,6 +87,31 @@ compiled ceiling of 0.60 rad/s still applies.
 `calib/make_teleop_config.py`. **Configs generated before this change do not
 have it, and `home` refuses to run without it** — regenerate, rather than
 guessing a pose nobody chose.
+
+### Save the current pose as Home
+
+Select a config and click **将当前位置保存为 Home** in the Robot panel. This
+works while idle, without opening the cameras, or between takes in a collect
+session. During a session it writes only that session's selected config.
+Stop motion and leave the robot's guiding mode first. Recording, active
+teleoperation, and mock/dry-run sessions cannot save a pose.
+
+The button calls `pnp7_teleop read-home <config>` to read the actual seven
+joint angles through FCI. This mode does not command motion or open the
+gripper, GELLO, or cameras. It refuses a moving robot or a pose outside the
+joint envelope used by `home`. Connection errors leave the config unchanged.
+
+The GUI updates `home_qpos` directly in `conf/<selected>.conf`, preserving
+the other parameters and comments, and shows the saved angles in radians.
+The previous file is saved as `<selected>.conf.home.bak`; the updated config
+is replaced atomically. A concurrent edit during capture aborts the save.
+The next Restore uses the new pose; no compilation is needed after saving.
+`calibration.json` is not changed, so regenerating a config from calibration
+later will replace this manually saved Home.
+
+Offline coverage: `pixi run python -m unittest gui.test_home` exercises config
+writes, backups, rejected states, and the HTTP action using a temporary config
+and a stand-in state reader. It never reads or moves the actual robot.
 
 `runDry` also gained a status publisher, so a dry session shows the same
 telemetry as a live one instead of looking like a bridge that failed to start.

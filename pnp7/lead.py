@@ -1,7 +1,7 @@
 """Driver for the PNP-7 lead (master) arm.
 
 Hardware discovered on this machine:
-  - 8x Dynamixel XL330 on one half-duplex bus behind an FT232H (/dev/pnp7_lead)
+  - 8x Dynamixel XL330 on one half-duplex bus behind an FT232H (/dev/gello)
   - Protocol 2.0, 1 Mbps
   - IDs 1..7 = arm joints J1..J7 (XL330-M288-T, model 1200)
   - ID  8    = gripper trigger    (XL330-M077-T, model 1190)
@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 import serial
 from dynamixel_sdk import PortHandler, PacketHandler, GroupSyncRead
 
-DEFAULT_PORT = "/dev/pnp7_lead"
+DEFAULT_PORT = "/dev/gello"
 DEFAULT_BAUD = 1000000
 
 ARM_IDS = (1, 2, 3, 4, 5, 6, 7)

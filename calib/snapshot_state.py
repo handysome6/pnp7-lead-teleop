@@ -57,7 +57,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", default="known-good")
     ap.add_argument("--out", default="known_good")
-    ap.add_argument("--port", default="/dev/pnp7_lead")
+    ap.add_argument("--port", default="/dev/gello")
     ap.add_argument("--baud", type=int, default=1000000)
     args = ap.parse_args()
 

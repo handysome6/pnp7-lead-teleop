@@ -69,7 +69,7 @@ def main() -> int:
     ap.add_argument("--unverify", nargs="*", default=[], metavar="Jn",
                     help="keep the sign but require live re-confirmation")
     ap.add_argument("--label", default="", help="name for this posture")
-    ap.add_argument("--port", default="/dev/pnp7_lead")
+    ap.add_argument("--port", default="/dev/gello")
     ap.add_argument("--baud", type=int, default=1000000)
     ap.add_argument("--robot-ip", default="172.16.0.2")
     args = ap.parse_args()

@@ -33,7 +33,7 @@ def find_deadman() -> str | None:
     serial string at all and shows up as the bare "HID 0483:5750", so the only
     thing left to recognise it by is VID:PID and the interface number.
     """
-    stable = "/dev/pnp7_deadman"
+    stable = "/dev/foot_brake"
     if os.path.exists(stable):
         return stable
     # if01 is the keyboard interface carrying the button; if02 is a mouse
@@ -186,7 +186,7 @@ def main() -> int:
         "# Check with check_correspondence.py before recording.",
     ] if flips else []) + [
         "",
-        f"lead_port={cal.get('port', '/dev/pnp7_lead')}",
+        f"lead_port={cal.get('port', '/dev/gello')}",
         f"lead_baud={cal.get('baud', 1000000)}",
         f"robot_ip={args.robot_ip}",
         f"deadman_device={deadman}",

@@ -35,10 +35,10 @@ REPO = Path(__file__).resolve().parent.parent
 #: A config with everything `home` and the status publisher need. Written for
 #: the stub bridge, but every key here is one the real loadConfig accepts.
 STUB_CONFIG = """\
-lead_port=/dev/pnp7_lead
+lead_port=/dev/gello
 lead_baud=1000000
 robot_ip=172.16.0.2
-deadman_device=/dev/pnp7_deadman
+deadman_device=/dev/foot_brake
 deadman_key=KEY_F3
 deadman_grab=1
 lead_servo_id=1 2 3 4 5 6 7

@@ -11,7 +11,7 @@ teleop 运行时靠 EVIOCGRAB 独占设备解决；但不跑 teleop 的时候按
 内核在 fd 关闭时自动解除独占（进程崩溃也一样），所以不存在把按钮永久
 锁死的情况。
 
-    python3 grab_button.py                       # 用 /dev/pnp7_deadman
+    python3 grab_button.py                       # 用 /dev/foot_brake
     python3 grab_button.py --device /dev/input/event6 --key KEY_V
     python3 grab_button.py --no-grab             # 只看事件，不接管
 """
@@ -75,7 +75,7 @@ def main() -> int:
     codes = {v: k for k, v in names.items()}
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default="/dev/pnp7_deadman")
+    ap.add_argument("--device", default="/dev/foot_brake")
     ap.add_argument("--key", default="",
                     help="只关心这个键（名字或数字）。留空则显示所有键。")
     ap.add_argument("--no-grab", action="store_true",

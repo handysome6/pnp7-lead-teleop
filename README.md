@@ -1,7 +1,7 @@
-# PNP-7 lead arm -> Franka teleoperation
+# GELLO (PNP-7) -> Franka teleoperation
 
 Implements V1 of `pnp7_roadmap.md`: relative joint-space teleoperation from the
-PNP-7 lead arm to the Franka, for VLA/imitation-learning data collection.
+GELLO (PNP-7) to the Franka, for VLA/imitation-learning data collection.
 
 ## Hardware as discovered
 
@@ -9,8 +9,8 @@ Nothing about this bus was documented, so it was identified by probing.
 
 | | |
 |---|---|
-| Lead arm bus | 8x Dynamixel XL330, Protocol 2.0, half-duplex behind an FT232H |
-| Lead arm device | `/dev/pnp7_lead` (udev symlink, stable across replug) |
+| GELLO bus | 8x Dynamixel XL330, Protocol 2.0, half-duplex behind an FT232H |
+| GELLO device | `/dev/gello` (udev symlink, stable across replug) |
 | Joints | IDs 1-7 = J1..J7, XL330-M288-T (model 1200) |
 | Gripper trigger | ID 8, XL330-M077-T (model 1190) |
 | Firmware | 52 on all servos |
@@ -44,10 +44,13 @@ python diag/set_baud.py --from-baud 1000000 --to 57600 --yes
 ```
 
 A udev rule (`/etc/udev/rules.d/99-pnp7-lead.rules`) pins the adapter to
-`/dev/pnp7_lead` and sets the ftdi_sio `latency_timer` to 1 ms (the 16 ms
+`/dev/gello` and sets the ftdi_sio `latency_timer` to 1 ms (the 16 ms
 default alone cost ~16 ms per cycle). `franka` was added to the `dialout` group.
 
-The same rule pins the dead-man button to `/dev/pnp7_deadman`. This was learned
+The same rule pins the foot brake to `/dev/foot_brake`.
+Legacy `/dev/pnp7_lead` and `/dev/pnp7_deadman` aliases remain available
+for older configurations. The foot brake takes priority over a connected
+SpaceMouse for the legacy deadman alias. This was learned
 the hard way: both devices were moved onto a USB hub, and while the lead arm
 survived (matched by serial), the dead-man moved from `event11` to `event6`
 while every config still named `event11`. By then `event11` had become the
@@ -100,7 +103,7 @@ needs three things:
   0600` by default, so Chrome (running as `franka`) cannot enumerate it and the
   device chooser comes up empty -- which looks like the switch is not
   connected. The udev rule opens up interface 00 only, as
-  `/dev/pnp7_deadman_cfg`; interfaces 01 and 02 stay root-only, because those
+  `/dev/foot_brake_cfg`; interfaces 01 and 02 stay root-only, because those
   carry real keystrokes and no web page should be able to read them.
 
 Two consequences for the udev rule:
@@ -343,24 +346,49 @@ system, which is as far as an unprivileged env can go.
 
 #### What is not commissioned on robot-s0 yet
 
-The *environment* is complete, and `check_ready.py` proves it the useful way:
-it runs every gate rather than quietly skipping the lead-arm ones the way the
-system `python3` does, so everything it reports is hardware. All of the gaps
-below need root, which this account does not have.
+The environment imports and offline selftest pass. `check_ready.py` checks
+the connected devices, but dependent checks are skipped after a prerequisite
+fails; it does not validate the RT kernel or scheduling permissions.
+
+2026-09-05 follow-up: `liushuai` now has sudo access. GELLO and the foot brake
+are connected and the udev rules are installed. The canonical names are
+`/dev/gello` (currently `ttyUSB0`) and `/dev/foot_brake` (currently `event24`,
+`KEY_F3`). The account belongs to `dialout`, `input`, and `plugdev`; existing
+sessions were also granted ACL access to these device nodes. New sessions
+inherit the groups. The FTDI latency timer is 1 ms.
+
+All eight GELLO servos were found at 57600 baud and changed to 1000000 baud
+using `diag/set_baud.py`; every baud register was read back successfully.
+A one-second readiness sample measured 495 Hz with zero failed frames and
+all eight servos passive. A physical foot-brake test then confirmed
+`KEY_F3` held continuously and released after 15.1 seconds of observation.
+
+Camera access was granted using `udev/99-robot-s0-cameras.rules`, scoped to
+D435i serials `216623060304` and `229123060429`. Named `liushuai` ACLs were
+applied to the two USB nodes, twelve video nodes and two hidraw nodes;
+read/write permission was verified as that user. Existing ownership and
+other users' access were preserved. Rules were reloaded for future events,
+without retriggering or resetting connected devices. No process held the
+camera nodes at inspection time. Per the operator's request, no camera SDK
+connection or streaming test was performed; enumeration and image capture
+remain unverified after this permission change.
+
+For the requested temporary non-RT trial, both `robot` and `home` explicitly
+use `RealtimeConfig::kIgnore`. This bypasses the startup checks below; it does
+not provide realtime scheduling or establish 1 kHz performance. The old
+`pnp7` controller has not been changed.
 
 | Gap | Effect | Fix |
 |---|---|---|
 | `ulimit -r` is 0 for `liushuai`. `/etc/security/limits.d/99-franka-raojiaji.conf` grants rtprio 99 to `raojiaji` only | libfranka's default `RealtimeConfig::kEnforce` refuses to start `robot` mode | add a `liushuai - rtprio 99` limits.d entry, then log out and back in |
 | Kernel is `6.8.0-138-generic`, PREEMPT_DYNAMIC -- not PREEMPT_RT. The robot PC runs `5.15.197-rt91` | the 1 kHz FCI loop has no realtime guarantee, so none of the timing recorded in this file carries over | install a PREEMPT_RT kernel before characterising anything |
-| `deadman/99-pnp7-lead.rules` is not installed, and no FT232H is on the USB bus | `/dev/pnp7_lead` and `/dev/pnp7_deadman` do not exist | plug the lead arm in, copy the rule into `/etc/udev/rules.d/`, `udevadm control --reload`, replug |
-| No librealsense udev rules; the D435i nodes are `crw-rw-r-- root root` | both cameras are on the bus (`lsusb` sees them) but `pyrealsense2` enumerates none | install `99-realsense-libusb.rules` |
-| `liushuai` is in neither `dialout` nor `plugdev` | serial and raw-USB access | add the groups, or let the udev rules above cover it |
+| Camera SDK enumeration and capture have not been retested after the ACL fix | device permissions pass, but images are not yet validated | test when the operator is ready and the cameras are free |
 | FCI port 1337 refuses while ICMP to `172.16.0.2` succeeds | the arm is wired and reachable on `enp131s0` (172.16.0.1/24) but FCI is not active | enable FCI in Desk and release the brakes |
 
 One more thing to know about the host alias: `robot-s0` points at
 `192.168.1.104`, which is the *WiFi* interface (`wlx60a3e345f593`). The machine
 also has `192.168.0.4` on USB ethernet and `172.16.0.1` on the FCI NIC. If the
-WiFi lease moves, the alias moves with it -- unlike `pnp7`, which is pinned to a
+WiFi lease changes, the SSH alias must be updated to the new IP -- unlike `pnp7`, which is pinned to a
 Tailscale address.
 
 ### Syncing the checkouts
@@ -450,7 +478,8 @@ conservative than them.
 
 ### Build and run
 
-On robot-s0 these run as written, with no `pixi run` in front: `build.sh`
+On robot-s0, build with `pixi run bridge`. The compiled binary runs without
+`pixi run` in front: `build.sh`
 bakes an RPATH onto `.pixi/envs/default/lib`, so the binary finds libfranka and
 libstdc++ from a bare shell. The RPATH is absolute, though, which is the catch
 -- move or delete the env, or relocate the checkout, and the binary stops
@@ -459,11 +488,11 @@ loading until `pixi run bridge` relinks it. The *Python* entry points
 or `pixi shell`.
 
 ```bash
-./build.sh
-./bin/pnp7_teleop selftest conf/pnp7_teleop.conf          # offline, 11 checks
-./bin/pnp7_teleop home     conf/pnp7_teleop.conf          # drive to home_qpos
-./bin/pnp7_teleop dry      conf/pnp7_teleop.conf 30 dry.csv   # hardware, no robot
-./bin/pnp7_teleop robot    conf/pnp7_teleop.conf 60 run.csv   # live
+pixi run bridge  # robot-s0; use ./build.sh with LIBFRANKA on the old robot PC
+./bin/pnp7_teleop selftest conf/full50b.conf             # offline, 11 checks
+./bin/pnp7_teleop home     conf/full50b.conf             # drive to home_qpos
+./bin/pnp7_teleop dry      conf/full50b.conf 30 dry.csv   # hardware, no robot
+./bin/pnp7_teleop robot    conf/full50b.conf 60 run.csv   # live
 ```
 
 `dry` runs the entire pipeline - lead arm, dead-man, clutch, safety chain -
@@ -473,7 +502,7 @@ the robot untouched. Always run it before `robot`.
 ## Data collection
 
 ```bash
-DURATION=60 CONF=conf/full50g.conf scripts/collect_episode.sh episodes/ep001
+DURATION=60 CONF=conf/full50b.conf scripts/collect_episode.sh episodes/ep001
 ```
 
 Starts both cameras, waits for `CAMERAS_READY` (auto-exposure needs to settle

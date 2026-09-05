@@ -56,7 +56,7 @@ def survey(port, packet):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/pnp7_lead")
+    ap.add_argument("--port", default="/dev/gello")
     ap.add_argument("--from-baud", type=int, default=1000000,
                     help="baud the servos are currently using")
     ap.add_argument("--to", type=int, choices=sorted(BAUD_CODES),

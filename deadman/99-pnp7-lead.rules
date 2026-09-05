@@ -1,4 +1,5 @@
-# PNP-7 rig: stable device names, independent of USB port and probe order.
+# GELLO and foot brake: stable device names across USB ports and replug.
+# Legacy pnp7_* aliases remain for older configs.
 #
 # Both devices were moved to a hub at one point, which renumbered them. The
 # lead arm survived because it is matched by serial; the dead-man did not,
@@ -8,7 +9,7 @@
 # /dev/ttyUSB* is assigned in probe order, so it moves if any other USB serial
 # device enumerates first. The ftdi_sio default latency_timer of 16 ms also
 # dominates the read cycle; 1 ms is required to sustain 400+ Hz SyncRead.
-SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", ATTRS{serial}=="FTAKC4NZ", SYMLINK+="pnp7_lead", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", ATTRS{serial}=="FTAKC4NZ", SYMLINK+="gello pnp7_lead", MODE="0660", GROUP="dialout"
 SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTRS{serial}=="FTAKC4NZ", ATTR{latency_timer}="1"
 
 # --- dead-man: nameless HID button, 0483:5750, emits KEY_F3 ---
@@ -23,7 +24,8 @@ SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTRS{serial}=="FTAKC4NZ", ATTR{lat
 # rule silently matches nothing. The ID_* properties are all set on the event
 # device itself by the usb_id/input_id builtins in 60-persistent-input.rules,
 # which run before this file.
-SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_VENDOR_ID}=="0483", ENV{ID_MODEL_ID}=="5750", ENV{ID_USB_INTERFACE_NUM}=="01", SYMLINK+="pnp7_deadman", MODE="0660", GROUP="input"
+# Prefer this button when a SpaceMouse is also attached.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_VENDOR_ID}=="0483", ENV{ID_MODEL_ID}=="5750", ENV{ID_USB_INTERFACE_NUM}=="01", SYMLINK+="foot_brake pnp7_deadman", OPTIONS+="link_priority=100", MODE="0660", GROUP="input"
 
 # Keep the desktop off the button. KEY_F3 is an ordinary keystroke that some
 # application holds a global binding for, so every press raised a window over
@@ -56,10 +58,10 @@ SUBSYSTEM=="input", ENV{ID_VENDOR_ID}=="0483", ENV{ID_MODEL_ID}=="5750", ENV{LIB
 # first rule tags the whole device, the second narrows to one interface with a
 # single ATTRS key.
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5750", ENV{PNP7_DEADMAN_HID}="1"
-SUBSYSTEM=="hidraw", ENV{PNP7_DEADMAN_HID}=="1", ATTRS{bInterfaceNumber}=="00", MODE="0660", GROUP="plugdev", SYMLINK+="pnp7_deadman_cfg"
+SUBSYSTEM=="hidraw", ENV{PNP7_DEADMAN_HID}=="1", ATTRS{bInterfaceNumber}=="00", MODE="0660", GROUP="plugdev", SYMLINK+="foot_brake_cfg pnp7_deadman_cfg"
 
 # --- dead-man, previous hardware: 3Dconnexion SpaceMouse Compact (BTN_0) ---
-# Kept so plugging the SpaceMouse back in still works. If both are attached at
-# once they fight over the symlink and whichever enumerates last wins, so do
-# not run with both plugged in.
+# Kept as a fallback when the HID button is absent. The button's higher link
+# priority wins when both are attached. SpaceMouse requires deadman_key=BTN_0;
+# the button uses KEY_F3, so select the matching config when changing devices.
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="256f", ATTRS{idProduct}=="c635", SYMLINK+="pnp7_deadman", MODE="0660", GROUP="input"

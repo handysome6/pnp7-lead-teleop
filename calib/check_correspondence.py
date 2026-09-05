@@ -47,7 +47,7 @@ def read_franka(ip):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--calibration", default="calibration.json")
-    ap.add_argument("--port", default="/dev/pnp7_lead")
+    ap.add_argument("--port", default="/dev/gello")
     ap.add_argument("--baud", type=int, default=1000000)
     ap.add_argument("--robot-ip", default="172.16.0.2")
     ap.add_argument("--reference",

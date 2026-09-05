@@ -159,6 +159,8 @@
       <h2>Session</h2>
       <label for="config">Config</label>
       <select id="config"></select>
+      <label class="check"><input type="checkbox" id="showDebug"> 显示关节调试配置</label>
+      <div class="hint" id="configHint"></div>
       <div class="params">
         <div><label for="duration">episode cap (s)</label><input id="duration" type="number" step="10" min="5" value="60"></div>
         <div><label for="prefix">episode prefix</label><input id="prefix" value="ep"></div>
@@ -183,7 +185,12 @@
 
     <section>
       <h2>Robot</h2>
-      <button class="wide" id="btnRestore" disabled>Restore start joints</button>
+      <button class="wide" id="btnSaveHome" disabled>将当前位置保存为 Home</button>
+      <div class="hint" id="homeTarget"></div>
+      <div class="hint">机器人静止后读取实际关节角，写入所选配置。保存不触发回位；
+        录制或遥操作运行时不可保存。</div>
+      <div class="hint" id="savedHome" style="overflow-wrap:anywhere"></div>
+      <button class="wide" id="btnRestore" style="margin-top:10px" disabled>Restore start joints</button>
       <div class="hint">Refused while F3 is held or an episode is open — the move
         would otherwise be recorded as demonstration.</div>
       <div class="joints" id="joints"></div>
@@ -221,6 +228,16 @@ let state = {};
 let camsBuilt = null;   // not "": that equals the empty join, so the
                         // idle state would never draw its placeholders
 let isMock = false;
+let homeSaveBusy = false;
+let configCatalog = [];
+
+function buildConfigOptions() {
+  const previous = $("config").value;
+  const options = configCatalog.filter(c => c.category !== "script"
+    && (c.category !== "debug" || $("showDebug").checked));
+  $("config").replaceChildren(...options.map(c => new Option(c.label || c.name, c.name)));
+  if (options.some(c => c.name === previous)) $("config").value = previous;
+}
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -286,7 +303,32 @@ function render(s) {
   $("btnTeleop").disabled = s.phase !== "idle";
   $("btnClose").disabled = !live;
   $("btnRestore").disabled = s.phase !== "ready" || s.deadman_held;
-  $("btnStart").disabled = s.phase !== "ready" || s.mode === "teleop";
+  const homeConfig = s.phase === "ready" ? s.config_name : $("config").value;
+  const homeAllowed = s.phase === "idle" || (s.phase === "ready" && s.mode === "collect");
+  $("btnSaveHome").disabled = homeSaveBusy || isMock || !homeConfig || !homeAllowed;
+  $("btnSaveHome").textContent = homeSaveBusy ? "正在读取并保存…" : "将当前位置保存为 Home";
+  $("homeTarget").textContent = isMock ? "模拟模式不写入真实配置"
+    : homeConfig ? `保存到 conf/${homeConfig}.conf` : "请先选择配置";
+  $("config").disabled = s.phase !== "idle" || homeSaveBusy;
+  $("showDebug").disabled = s.phase !== "idle" || homeSaveBusy;
+  if (live && s.config_name) $("config").value = s.config_name;
+  const selected = configCatalog.find(c => c.name === $("config").value);
+  $("configHint").textContent = selected
+    ? `${selected.name}.conf${selected.category === "debug" ? " · 调试配置，仅启用指定关节" : ""}` : "没有可用配置";
+  if (!$("config").value) {
+    $("btnOpen").disabled = true;
+    $("btnTeleop").disabled = true;
+  }
+  const saved = s.saved_home;
+  $("savedHome").textContent = saved && saved.config_name === homeConfig
+    ? `已保存 J1–J7（rad）：${saved.q.map(q => q.toFixed(6)).join(" ")}` : "";
+  if (homeSaveBusy) {
+    $("btnOpen").disabled = true;
+    $("btnTeleop").disabled = true;
+    $("btnClose").disabled = true;
+    $("btnRestore").disabled = true;
+  }
+  $("btnStart").disabled = homeSaveBusy || s.phase !== "ready" || s.mode === "teleop";
   $("btnStop").disabled = !rec;
   $("btnDiscard").disabled = !rec;
   $("btnFinalize").disabled = !live || s.mode === "teleop";
@@ -342,6 +384,16 @@ $("btnOpen").onclick     = () => open("collect");
 $("btnTeleop").onclick   = () => open("teleop");
 $("btnClose").onclick    = () => cmd("close_session");
 $("btnRestore").onclick  = () => cmd("restore_joints");
+$("btnSaveHome").onclick = async () => {
+  if (homeSaveBusy || $("btnSaveHome").disabled) return;
+  const config_name = state.phase === "ready" ? state.config_name : $("config").value;
+  homeSaveBusy = true;
+  render(state);
+  try { await cmd("save_home", { config_name }); }
+  finally { homeSaveBusy = false; await refresh(); }
+};
+$("config").onchange = () => render(state);
+$("showDebug").onchange = () => { buildConfigOptions(); render(state); };
 $("btnStart").onclick    = () => cmd("begin_episode");
 $("btnStop").onclick     = () => cmd("end_episode");
 $("btnDiscard").onclick  = () => cmd("discard_episode");
@@ -377,8 +429,8 @@ document.addEventListener("keyup", (e) => {
 (async function init() {
   try {
     const info = await api("/api/configs");
-    $("config").innerHTML = info.configs
-      .map((c) => `<option value="${c.name}">${c.name}</option>`).join("");
+    configCatalog = info.configs;
+    buildConfigOptions();
     isMock = !!info.mock;
   } catch (e) { showErr(e.message); }
   if (isMock) $("mockPanel").style.display = "";

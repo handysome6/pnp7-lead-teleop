@@ -105,7 +105,7 @@ int32_t wrapDelta(int32_t curr, int32_t prev) {
 // ---------------------------------------------------------------- config ---
 
 struct Config {
-  std::string lead_port{"/dev/pnp7_lead"};
+  std::string lead_port{"/dev/gello"};
   int lead_baud{1000000};
   std::string robot_ip{"172.16.0.2"};
   std::string deadman_device;
@@ -1459,7 +1459,8 @@ int runRobot(const Config& config, double duration_s,
                         config.deadman_grab);
   deadman.open();
 
-  franka::Robot robot(config.robot_ip);
+  // Temporary robot-s0 trial: allow startup without RT scheduling/kernel checks.
+  franka::Robot robot(config.robot_ip, franka::RealtimeConfig::kIgnore);
   const franka::RobotState before = robot.readOnce();
   if (before.robot_mode != franka::RobotMode::kIdle) {
     throw std::runtime_error(
@@ -1612,6 +1613,33 @@ int runRobot(const Config& config, double duration_s,
 
 void handleSignal(int) { g_interrupted.store(true); }
 
+// Read the real joint pose for the GUI's Save Home action. No control call,
+// gripper connection, GELLO access, or motion command is made in this mode.
+int readHomePose(const Config& config) {
+  franka::Robot robot(config.robot_ip, franka::RealtimeConfig::kIgnore);
+  const auto state = robot.readOnce();
+  if (state.robot_mode != franka::RobotMode::kIdle) {
+    throw std::runtime_error("save home refused: stop motion and leave guiding mode first");
+  }
+  for (int i = 0; i < kNumJoints; ++i) {
+    if (!std::isfinite(state.q[i]) || !std::isfinite(state.dq[i]) ||
+        std::abs(state.dq[i]) > 0.01) {
+      throw std::runtime_error("save home refused: robot must be stationary");
+    }
+    if (state.q[i] < kQMin[i] + kJointLimitMargin ||
+        state.q[i] > kQMax[i] - kJointLimitMargin) {
+      throw std::runtime_error("save home refused: pose is outside the home joint envelope");
+    }
+  }
+  std::cout << "HOME_QPOS [" << std::setprecision(17);
+  for (int i = 0; i < kNumJoints; ++i) {
+    if (i) std::cout << ",";
+    std::cout << state.q[i];
+  }
+  std::cout << "]\n";
+  return 0;
+}
+
 // ----------------------------------------------------------------- home ---
 
 // Drive the arm to the configured joint pose and stop. This is the one motion
@@ -1661,7 +1689,8 @@ int runHome(const Config& config) {
     target[i] = std::min(std::max(target[i], lo), hi);
   }
 
-  franka::Robot robot(config.robot_ip);
+  // Match robot mode during the temporary robot-s0 non-RT trial.
+  franka::Robot robot(config.robot_ip, franka::RealtimeConfig::kIgnore);
   const franka::RobotState before = robot.readOnce();
   if (before.robot_mode != franka::RobotMode::kIdle) {
     throw std::runtime_error(
@@ -1745,6 +1774,7 @@ void printUsage(const char* program) {
   std::cout << "usage:\n"
             << "  " << program << " selftest <config>\n"
             << "  " << program << " home <config>\n"
+            << "  " << program << " read-home <config>  (read only)\n"
             << "  " << program << " dry <config> <seconds> [log.csv]\n"
             << "  " << program << " robot <config> <seconds> [log.csv]\n";
 }
@@ -1765,6 +1795,7 @@ int main(int argc, char** argv) {
 
     if (mode == "selftest") return runSelfTest(config);
     if (mode == "home") return runHome(config);
+    if (mode == "read-home") return readHomePose(config);
 
     if (argc < 4) {
       printUsage(argv[0]);

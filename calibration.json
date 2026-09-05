@@ -1,6 +1,6 @@
 {
   "created": "2026-08-20T03:55:44.455028+00:00",
-  "port": "/dev/pnp7_lead",
+  "port": "/dev/gello",
   "baud": 1000000,
   "neutral_ticks": [
     1013,

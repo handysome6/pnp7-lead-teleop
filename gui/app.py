@@ -4,6 +4,10 @@ On the robot PC, from the repo root:
 
     .venv/bin/python -m gui.app
 
+On robot-s0:
+
+    pixi run python -m gui.app
+
 That supervises `bin/pnp7_teleop` and `collect/record_cameras.py` — the same
 processes `scripts/collect_episode.sh` runs, in the same order, but with the
 operator deciding where each take starts and ends. Nothing touches the robot
@@ -68,12 +72,12 @@ def main(argv: list[str] | None = None) -> int:
         backend = MockBackend()
         mock_backend = backend
     else:
-        from gui.legacy_backend import BRIDGE, VENV_PYTHON, LegacyBackend
+        from gui.legacy_backend import BRIDGE, PYTHON, LegacyBackend
 
         # Fail here with something readable, rather than at the first click
         # with a subprocess error from four layers down.
-        if not VENV_PYTHON.is_file():
-            print(f"missing {VENV_PYTHON} -- see 'Setting up a checkout' in "
+        if not PYTHON.is_file():
+            print(f"missing {PYTHON} -- see 'Setting up a checkout' in "
                   "the README", file=sys.stderr)
             return 1
         if not BRIDGE.is_file():

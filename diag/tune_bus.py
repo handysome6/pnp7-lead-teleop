@@ -26,7 +26,7 @@ ADDR_TORQUE_ENABLE = 64
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/pnp7_lead")
+    ap.add_argument("--port", default="/dev/gello")
     ap.add_argument("--baud", type=int, default=1000000)
     ap.add_argument("--raw", type=int, choices=range(0, 254), metavar="0-253",
                     help="return delay in units of 2 us (0 = no delay)")

@@ -1,7 +1,7 @@
 """Pre-flight readiness check for PNP-7 -> Franka data collection.
 
 Reports every gate that must be green before teleoperation can run. Purely
-diagnostic: it reads the lead arm bus, queries the Franka controller's status
+diagnostic: it reads the GELLO bus, queries the Franka controller's status
 endpoint and TCP ports, and enumerates cameras. It never commands anything.
 """
 from __future__ import annotations
@@ -51,22 +51,22 @@ def check_lead(rep: Report, port: str, baud: int) -> None:
     try:
         from pnp7.lead import ALL_IDS, PNP7Lead
     except ImportError as exc:
-        rep.add(FAIL, "lead arm driver import", str(exc))
+        rep.add(FAIL, "GELLO driver import", str(exc))
         return
 
     lead = PNP7Lead(port, baud)
     try:
         lead.open()
     except Exception as exc:
-        rep.add(FAIL, f"lead arm bus {port} @ {baud}", str(exc))
+        rep.add(FAIL, f"GELLO bus {port} @ {baud}", str(exc))
         return
 
     try:
         torque = lead.assert_torque_disabled()
-        rep.add(OK, "lead arm torque disabled",
+        rep.add(OK, "GELLO torque disabled",
                 f"all {len(torque)} servos passive")
     except Exception as exc:
-        rep.add(FAIL, "lead arm torque state", str(exc))
+        rep.add(FAIL, "GELLO torque state", str(exc))
         lead.close()
         return
 
@@ -76,7 +76,7 @@ def check_lead(rep: Report, port: str, baud: int) -> None:
             n += 1
     rate = n / (time.perf_counter() - t0)
     status = OK if rate >= 100 else (WARN if rate >= 50 else FAIL)
-    rep.add(status, "lead arm sample rate",
+    rep.add(status, "GELLO sample rate",
             f"{rate:.0f} Hz over {len(ALL_IDS)} servos, "
             f"{lead.read_failures} failed frames")
     lead.close()
@@ -85,7 +85,7 @@ def check_lead(rep: Report, port: str, baud: int) -> None:
 def load_key_names() -> dict[str, int]:
     """Kernel key names -> codes, parsed from the header.
 
-    The dead-man key is no longer fixed: the SpaceMouse reported BTN_0, the
+    The foot brake key is no longer fixed: the SpaceMouse reported BTN_0, the
     button that replaced it emits an ordinary keyboard code. Reading the header
     keeps this in step with the kernel instead of with a stale local table.
     """
@@ -120,7 +120,7 @@ def resolve_key(spec: str) -> tuple[int, str]:
 
 
 def check_desktop_ignores(rep: Report, path: str) -> None:
-    """The desktop must not also be listening to the dead-man button.
+    """The desktop must not also be listening to the foot brake button.
 
     The replacement button enumerates as a plain HID keyboard emitting KEY_F3,
     which some application holds a global binding for, so every press raised a
@@ -136,19 +136,19 @@ def check_desktop_ignores(rep: Report, path: str) -> None:
         info = subprocess.run(["udevadm", "info", "--query=env", f"--name={target}"],
                               capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError) as exc:
-        rep.add(WARN, "desktop ignores dead-man", f"cannot query udev: {exc}")
+        rep.add(WARN, "desktop ignores foot brake", f"cannot query udev: {exc}")
         return
     if "LIBINPUT_IGNORE_DEVICE=1" in info:
-        rep.add(OK, "desktop ignores dead-man",
+        rep.add(OK, "desktop ignores foot brake",
                 "LIBINPUT_IGNORE_DEVICE=1 -- presses do not reach GNOME")
     else:
-        rep.add(WARN, "desktop ignores dead-man",
+        rep.add(WARN, "desktop ignores foot brake",
                 "not set -- the desktop still acts on the button outside "
                 "teleop; reload 99-pnp7-lead.rules and replug")
 
 
 def check_deadman(rep: Report, path: str, key_spec: str) -> None:
-    """The dead-man is a safety device: verify it before a session, not during.
+    """The foot brake is a safety device: verify it before a session, not during.
 
     This gate exists because a replug once renumbered the SpaceMouse from
     event11 to event6 while every other check still read PASS.
@@ -160,17 +160,17 @@ def check_deadman(rep: Report, path: str, key_spec: str) -> None:
     try:
         key_code, key_name = resolve_key(key_spec)
     except ValueError:
-        rep.add(FAIL, "dead-man switch", f"unknown key {key_spec!r}")
+        rep.add(FAIL, "foot brake switch", f"unknown key {key_spec!r}")
         return
 
     if not os.path.exists(path):
-        rep.add(FAIL, f"dead-man device {path}",
+        rep.add(FAIL, f"foot brake device {path}",
                 "missing -- check the udev rule and that it is plugged in")
         return
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError as exc:
-        rep.add(FAIL, f"dead-man device {path}", f"cannot open: {exc}")
+        rep.add(FAIL, f"foot brake device {path}", f"cannot open: {exc}")
         return
     try:
         def _ioc_read(nr, size):
@@ -191,16 +191,16 @@ def check_deadman(rep: Report, path: str, key_spec: str) -> None:
         has_key = bool(keys[key_code // 8] & (1 << (key_code % 8)))
     except OSError as exc:
         os.close(fd)
-        rep.add(WARN, f"dead-man device {path}", f"opened but query failed: {exc}")
+        rep.add(WARN, f"foot brake device {path}", f"opened but query failed: {exc}")
         return
     os.close(fd)
 
     target = os.path.realpath(path)
     if has_key:
-        rep.add(OK, "dead-man switch",
+        rep.add(OK, "foot brake switch",
                 f"{dev_name} at {target}, {key_name} present")
     else:
-        rep.add(FAIL, "dead-man switch",
+        rep.add(FAIL, "foot brake switch",
                 f"{dev_name} at {target} does not report {key_name}")
 
 
@@ -281,20 +281,20 @@ def check_cameras(rep: Report) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/pnp7_lead")
+    ap.add_argument("--port", default="/dev/gello")
     ap.add_argument("--baud", type=int, default=1000000)
     ap.add_argument("--robot-ip", default=ROBOT_IP)
     ap.add_argument("--deadman", default=None)
     ap.add_argument("--deadman-key", default=None,
                     help="key name or code the button emits (e.g. BTN_0, KEY_V)")
-    ap.add_argument("--config", default="conf/pnp7_teleop.conf",
+    ap.add_argument("--config", default="conf/full50b.conf",
                     help="teleop config to take deadman_device/deadman_key "
                          "from, so this check and the bridge cannot disagree")
     ap.add_argument("--skip-cameras", action="store_true")
     args = ap.parse_args()
 
     # The config is the single source of truth for which device and which key.
-    # Duplicating the default here is how the two drift apart, and a dead-man
+    # Duplicating the default here is how the two drift apart, and a foot brake
     # that the pre-flight validated but the bridge cannot see is the worst
     # possible failure of this script.
     conf: dict[str, str] = {}
@@ -308,11 +308,11 @@ def main() -> int:
     except OSError:
         pass
 
-    deadman = args.deadman or conf.get("deadman_device", "/dev/pnp7_deadman")
+    deadman = args.deadman or conf.get("deadman_device", "/dev/foot_brake")
     deadman_key = args.deadman_key or conf.get("deadman_key", "BTN_0")
 
     rep = Report()
-    print("=== lead arm ===")
+    print("=== GELLO ===")
     check_lead(rep, args.port, args.baud)
     check_deadman(rep, deadman, deadman_key)
     check_desktop_ignores(rep, deadman)

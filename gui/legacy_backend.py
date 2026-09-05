@@ -32,6 +32,7 @@ import json
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -40,9 +41,12 @@ import cv2
 import numpy as np
 
 from gui.session import Backend, Mode, Rejected
+from gui.home_config import save_current_home
 
 REPO = Path(__file__).resolve().parent.parent
-VENV_PYTHON = REPO / ".venv" / "bin" / "python"
+# Recorder and post-processing must use the environment running the GUI.
+# This works for both pixi on robot-s0 and the old controller's .venv.
+PYTHON = Path(sys.executable)
 BRIDGE = REPO / "bin" / "pnp7_teleop"
 RECORDER = REPO / "collect" / "record_cameras.py"
 
@@ -116,7 +120,7 @@ class LegacyBackend(Backend):
                  preview_dir: str | Path = "/tmp/pnp7_preview",
                  status_path: str | Path = "/tmp/pnp7_gui_status.json",
                  bridge: str | Path = BRIDGE,
-                 python: str | Path = VENV_PYTHON,
+                 python: str | Path = PYTHON,
                  recorder: str | Path = RECORDER,
                  conf_dir: str | Path | None = None,
                  scratch_dir: str | Path = "/tmp"):
@@ -280,6 +284,42 @@ class LegacyBackend(Backend):
         return telemetry
 
     # --- operator actions -------------------------------------------------
+    def save_home(self, config_name: str) -> dict[str, Any]:
+        if self._bridge is not None and self._bridge.alive:
+            raise Rejected("请先停止遥操作，再保存 Home")
+        if self._config_path is not None and self._dry_run:
+            raise Rejected("请先关闭 dry run 会话，再读取实际机器人姿态")
+        if not isinstance(config_name, str) or not config_name or Path(config_name).name != config_name:
+            raise Rejected("请选择有效的配置文件")
+        config = self.conf_dir / f"{config_name}.conf"
+        if (config.is_symlink() or config.resolve().parent != self.conf_dir.resolve()
+                or not config.is_file()):
+            raise Rejected("配置必须是 conf 目录中的普通 .conf 文件")
+        if self._config_path is not None and config.resolve() != self._config_path.resolve():
+            raise Rejected("只能保存到当前会话使用的配置")
+
+        def read_q() -> list[float]:
+            try:
+                result = subprocess.run(
+                    [str(self.bridge), "read-home", str(config)], cwd=str(REPO),
+                    capture_output=True, text=True, timeout=15,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise Rejected("读取机器人姿态超时，配置未修改") from exc
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "FCI read failed").strip()
+                raise Rejected("读取机器人姿态失败，配置未修改：" + detail.splitlines()[-1])
+            records = [line.removeprefix("HOME_QPOS ") for line in result.stdout.splitlines()
+                       if line.startswith("HOME_QPOS ")]
+            if len(records) != 1:
+                raise Rejected("未收到机器人姿态，配置未修改；请重新编译 bridge")
+            try:
+                return json.loads(records[0])
+            except json.JSONDecodeError as exc:
+                raise Rejected("机器人姿态数据格式错误，配置未修改") from exc
+
+        return save_current_home(config, read_q)
+
     def restore_joints(self, qpos: list[float] | None = None) -> None:
         """Item 1: `pnp7_teleop home`, which owns the FCI for the move.
 
@@ -414,8 +454,21 @@ class LegacyBackend(Backend):
         return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
 
     def list_configs(self) -> list[dict[str, Any]]:
-        return [{"name": p.stem, "path": str(p)}
-                for p in sorted(self.conf_dir.glob("*.conf"))]
+        presets = {
+            "full100b": ("standard", "标准遥操 · 1:1 · 二值夹爪", 0),
+            "full50b": ("standard", "半幅遥操 · 0.5 倍 · 二值夹爪", 1),
+            "j6only": ("debug", "J6 单关节检查 · 0.25 倍", 2),
+            "j7only": ("debug", "J7 单关节检查 · 0.25 倍", 3),
+            "demo": ("script", "演示脚本专用", 4),
+        }
+        configs = []
+        for p in self.conf_dir.glob("*.conf"):
+            if not p.is_file() or p.is_symlink():
+                continue
+            category, label, order = presets.get(p.stem, ("debug", p.stem, 99))
+            configs.append({"name": p.stem, "path": str(p), "label": label,
+                            "category": category, "order": order})
+        return sorted(configs, key=lambda c: (c["order"], c["name"]))
 
     # --- internals: the bridge -------------------------------------------
     def _start_bridge(self, log_csv: Path | None,

@@ -87,6 +87,7 @@ class SessionState:
     config_name: str | None = None
     error: str | None = None
     message: str = ""
+    saved_home: dict[str, Any] | None = None
 
     # --- teleop / safety -------------------------------------------------
     deadman_held: bool = False
@@ -120,6 +121,7 @@ class SessionState:
             "config_name": self.config_name,
             "error": self.error,
             "message": self.message,
+            "saved_home": self.saved_home,
             "deadman_held": self.deadman_held,
             "stream_enabled": self.stream_enabled,
             "block_reason": self.block_reason,
@@ -184,6 +186,10 @@ class Backend:
         raise NotImplementedError
 
     # --- operator actions -------------------------------------------------
+    def save_home(self, config_name: str) -> dict[str, Any]:
+        """Read the actual robot joints and update the selected config only."""
+        raise Rejected("此后端不支持保存实际机器人 Home")
+
     def restore_joints(self, qpos: list[float] | None = None) -> None:
         """Item 1: drive the arm back to the configured start configuration."""
         raise NotImplementedError
@@ -379,6 +385,19 @@ class ControlLoop:
             st.config_name = None
             st.cameras = []
             st.message = "session closed"
+
+        elif name == "save_home":
+            if st.phase not in (Phase.IDLE, Phase.READY):
+                raise Rejected("请先结束录制，再保存 Home")
+            if st.phase is Phase.READY and st.mode is Mode.TELEOP:
+                raise Rejected("请先关闭遥操作会话，再保存 Home")
+            config_name = cmd.args.get("config_name")
+            if st.phase is Phase.READY and config_name != st.config_name:
+                raise Rejected("只能保存到当前会话使用的配置")
+            result = self.backend.save_home(config_name)
+            st.saved_home = result
+            st.error = None
+            st.message = f"已将当前位置保存至 conf/{result['config_name']}.conf 的 home_qpos"
 
         elif name == "restore_joints":
             # Refused while recording: the move would be written into the

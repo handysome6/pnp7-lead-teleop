@@ -91,7 +91,7 @@ def read_franka(ip: str) -> dict | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/pnp7_lead")
+    ap.add_argument("--port", default="/dev/gello")
     ap.add_argument("--baud", type=int, default=1000000)
     ap.add_argument("--robot-ip", default="172.16.0.2")
     ap.add_argument("--out", default="calibration.json")

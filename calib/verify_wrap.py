@@ -29,7 +29,7 @@ WATCH = [5, 6]          # servo ids resting on the wrap boundary
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/pnp7_lead")
+    ap.add_argument("--port", default="/dev/gello")
     ap.add_argument("--baud", type=int, default=1000000)
     ap.add_argument("--seconds", type=float, default=40.0)
     ap.add_argument("--max-step", type=int, default=200,
