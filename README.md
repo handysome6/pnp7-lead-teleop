@@ -14,7 +14,7 @@ Nothing about this bus was documented, so it was identified by probing.
 | Joints | IDs 1-7 = J1..J7, XL330-M288-T (model 1200) |
 | Gripper trigger | ID 8, XL330-M077-T (model 1190) |
 | Firmware | 52 on all servos |
-| Franka | Panda @ `172.16.0.2` via `enp4s0` (172.16.0.1/24), libfranka 0.15.0 |
+| Franka | FR3 @ `172.16.0.2` via `enp4s0` (172.16.0.1/24) -- see "libfranka version" below |
 | Cameras | 2x RealSense D435i - `213622078826` external, `233622071437` wrist |
 | Kernel | 5.15.197-rt91 PREEMPT_RT |
 
@@ -127,6 +127,45 @@ the grab when the fd closes, including on a crash, so the button cannot be left
 captured. `grab_button.py` does the same thing standalone, for checking the
 takeover without starting the bridge.
 
+## libfranka version
+
+**2026-09: the arm's firmware was upgraded past FR3 System Version 5.9.0, and
+libfranka 0.15.0 no longer connects.** The bridge will not run until libfranka
+is rebuilt.
+
+libfranka pins itself to a minimum firmware: 0.15.0 declares `>= 5.7.2`, and
+0.18.0 declares `>= 5.9.0`. Once the robot crossed 5.9.0, everything below
+0.18.0 is out.
+
+**Rebuild at 0.20.0 or newer -- not 0.18.** 0.18.0 changed `RobotState` to
+float-based fields, which breaks every one of the ~13 places
+`src/pnp7_teleop.cpp` assigns `robot_state.q` (and `dq`, `tau_J`, `O_T_EE`,
+`O_F_ext_hat_K`) straight into a `std::array<double, 7>`. 0.20.0 reverted that
+change -- "reverting the float change within the robot state back to doubles" --
+so on 0.20+ those lines compile unchanged. Choosing 0.18 or 0.19 means adding
+conversions in all of them for no benefit.
+
+Nothing else the bridge uses is touched: `Robot::control`, `JointPositions`,
+`RobotMode`, `RobotState::current_errors`, `Gripper` and `Duration` have no
+changelog entries across 0.15 -> 0.21. The one 0.18 deprecation that could have
+applied -- `computeUpperLimitsJointVelocity` / `computeLowerLimitsJointVelocity`
+-- was reached through `<franka/rate_limiting.h>`, which was included but never
+used; the include has been dropped.
+
+Two things to check after rebuilding, neither of them a code change yet:
+
+- **`build.sh` linking.** 0.18.0 moved to static linking. The script passes
+  `-L$LIBFRANKA/build -lfranka -Wl,-rpath,...`; with a static `libfranka.a` the
+  rpath is inert but harmless. Confirm `ldd bin/pnp7_teleop` looks sane.
+- **The hardcoded joint limits.** `kQMin` / `kQMax` in `src/pnp7_teleop.cpp` are
+  commented "Franka Panda joint limits" and carry Panda's numbers. FR3's
+  envelope differs -- most visibly on J6, where Panda allows roughly -1 deg and
+  FR3 starts at about +25 deg -- and FR3's envelope was itself widened at system
+  5.9.0. The compiled ceiling is therefore no longer guaranteed to be the more
+  conservative of the two. This has not bitten because the calibration posture
+  keeps J6 near 173 deg, but it should be checked against the firmware actually
+  installed rather than against a datasheet.
+
 ## Setting up a checkout
 
 Three of the things this repo needs are deliberately not tracked: `bin/` and
@@ -139,7 +178,7 @@ Already present on the robot PC, and not rebuilt by any of this:
 
 | | |
 |---|---|
-| libfranka | 0.15.0, built, at `~/catkin_franka/libfranka` |
+| libfranka | built at `~/catkin_franka/libfranka` -- version now constrained, see below |
 | Eigen | `/usr/include/eigen3` |
 | `uv` | `/usr/bin/uv` |
 

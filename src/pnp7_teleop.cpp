@@ -14,7 +14,6 @@
 #include <franka/exception.h>
 #include <franka/gripper.h>
 #include <franka/robot.h>
-#include <franka/rate_limiting.h>
 
 #include "dynamixel_sdk.h"
 
