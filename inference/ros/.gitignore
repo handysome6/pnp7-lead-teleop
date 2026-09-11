@@ -1,0 +1,9 @@
+.pixi/
+src/
+vendor/
+build/
+devel/
+logs/
+.catkin_tools/
+build_latest.log
+.validate.lock

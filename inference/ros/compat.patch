@@ -1,0 +1,26 @@
+--- a/franka_ros/franka_description/CMakeLists.txt
++++ b/franka_ros/franka_description/CMakeLists.txt
+@@ -14,3 +14,5 @@
+-catkin_add_nosetests(test/franka_robot_urdf.py)
+-catkin_add_nosetests(test/hand_urdf.py)
+-catkin_add_nosetests(test/dual_panda_example_urdf.py)
++if(CATKIN_ENABLE_TESTING)
++  catkin_add_nosetests(test/franka_robot_urdf.py)
++  catkin_add_nosetests(test/hand_urdf.py)
++  catkin_add_nosetests(test/dual_panda_example_urdf.py)
++endif()
+--- a/franka_ros/franka_hw/CMakeLists.txt
++++ b/franka_ros/franka_hw/CMakeLists.txt
+@@ -4 +4 @@
+-set(CMAKE_CXX_STANDARD 14)
++set(CMAKE_CXX_STANDARD 17)
+--- a/franka_ros/franka_control/CMakeLists.txt
++++ b/franka_ros/franka_control/CMakeLists.txt
+@@ -4 +4 @@
+-set(CMAKE_CXX_STANDARD 14)
++set(CMAKE_CXX_STANDARD 17)
+--- a/franka_ros/franka_hw/include/franka_hw/resource_helpers.h
++++ b/franka_ros/franka_hw/include/franka_hw/resource_helpers.h
+@@ -12 +12,2 @@
++#include <cstdint>
+ #include <franka_hw/control_mode.h>

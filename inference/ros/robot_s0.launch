@@ -1,0 +1,15 @@
+<launch>
+  <arg name="robot_ip" default="172.16.0.2" />
+  <!-- Only the state controller starts. Impedance stays LOADED/STOPPED. -->
+  <include file="$(find franka_control)/launch/franka_control.launch">
+    <arg name="robot_ip" value="$(arg robot_ip)" />
+    <arg name="robot" value="fr3" />
+    <arg name="arm_id" value="fr3" />
+    <arg name="load_gripper" value="false" />
+  </include>
+  <param name="/franka_control/preserve_collision_behavior" value="true" />
+  <param name="/franka_state_controller/publish_rate" value="100" />
+  <rosparam command="load" file="$(dirname)/robot_s0_impedance.yaml" />
+  <node name="policy_controller_loader" pkg="controller_manager" type="spawner"
+        args="--stopped cartesian_impedance_controller" output="screen" />
+</launch>

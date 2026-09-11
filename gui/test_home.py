@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from gui.home_config import save_current_home
 from gui.legacy_backend import LegacyBackend
@@ -127,16 +127,156 @@ class SaveHomeTests(unittest.TestCase):
             self.backend.save_home("demo")
         self.assertEqual(self.config.read_bytes(), self.original)
 
-    def test_recording_and_teleop_guards_do_not_call_backend(self):
+    def test_recording_and_opening_guards_do_not_call_backend(self):
         loop = ControlLoop(self.backend)
         for phase, mode in ((Phase.RECORDING, Mode.COLLECT),
-                            (Phase.READY, Mode.TELEOP), (Phase.OPENING, Mode.COLLECT)):
+                            (Phase.OPENING, Mode.COLLECT)):
             loop.state.phase, loop.state.mode = phase, mode
             with patch.object(self.backend, "save_home") as save:
                 with self.assertRaises(Rejected):
                     loop._apply(Command("save_home", {"config_name": "demo"}))
                 save.assert_not_called()
             self.assertEqual(loop.state.phase, phase)
+
+    def teleop(self, held=0, state=2):
+        self.backend._mode = Mode.TELEOP
+        self.backend._config_path = self.config
+        bridge = Mock(alive=True)
+        bridge.proc.poll.return_value = 0
+        self.backend._bridge = bridge
+        events = []
+        def stop():
+            events.append("stop")
+            self.backend._bridge = None
+        def start(log_csv):
+            self.assertIsNone(log_csv)
+            events.append("start")
+            self.backend._bridge = bridge
+        self.stop = patch.object(self.backend, "_stop_bridge", side_effect=stop).start()
+        self.start = patch.object(self.backend, "_start_bridge", side_effect=start).start()
+        self.status = patch.object(self.backend, "_read_status", return_value={
+            "deadman": held, "state": state}).start()
+        self.addCleanup(patch.stopall)
+        self.backend._viewfinder = object()
+        return events, bridge
+
+    def test_teleop_save_reads_measured_pose_after_stop_then_resumes(self):
+        events, _ = self.teleop()
+        preview = self.backend._viewfinder
+        run = __import__("subprocess").run
+        def read(*args, **kwargs):
+            self.assertIsNone(self.backend._bridge)
+            events.append("read")
+            return run(*args, **kwargs)
+        with patch("gui.legacy_backend.subprocess.run", side_effect=read):
+            result = self.backend.save_home("demo")
+        self.assertEqual(result["q"], Q)
+        self.assertEqual(events, ["stop", "read", "start"])
+        self.assertIs(self.backend._viewfinder, preview)
+        self.assertIsNotNone(self.backend._bridge)
+
+    def test_teleop_restore_yields_fci_and_resumes(self):
+        events, _ = self.teleop()
+        def restore():
+            self.assertIsNone(self.backend._bridge)
+            events.append("home")
+        with patch.object(self.backend, "_restore_home", side_effect=restore):
+            self.backend.restore_joints()
+        self.assertEqual(events, ["stop", "home", "start"])
+
+    def test_fresh_backend_pedal_guard_overrides_stale_gui(self):
+        events, _ = self.teleop()
+        for status in (None, {}, {"deadman": 1, "state": 2},
+                       {"deadman": 0, "state": 1}):
+            self.status.return_value = status
+            for action in (lambda: self.backend.save_home("demo"), self.backend.restore_joints):
+                with self.subTest(status=status), self.assertRaises(Rejected):
+                    action()
+        self.assertEqual(events, [])
+        self.assertEqual(self.config.read_bytes(), self.original)
+
+    def test_stale_status_file_is_rejected_before_handover(self):
+        events, _ = self.teleop()
+        self.backend.status_path = self.root / "status.json"
+        self.backend.status_path.write_text('{"deadman": 0, "state": 2}')
+        os.utime(self.backend.status_path, (1, 1))
+        self.status.side_effect = lambda: LegacyBackend._read_status(self.backend)
+        with self.assertRaises(Rejected):
+            self.backend.restore_joints()
+        self.assertEqual(events, [])
+
+    def test_failed_bridge_exit_never_starts_home_or_resumes(self):
+        events, bridge = self.teleop()
+        bridge.proc.poll.return_value = 1
+        bridge.log_path = self.root / "fault.log"
+        bridge.log_path.write_text("control fault")
+        with patch.object(self.backend, "_restore_home") as home:
+            with self.assertRaisesRegex(RuntimeError, "暂停遥操失败"):
+                self.backend.restore_joints()
+            home.assert_not_called()
+        self.assertEqual(events, ["stop"])
+
+    def test_home_refusal_resumes_but_fault_does_not(self):
+        for error, expected in ((Rejected("home refused: F3 held"), ["stop", "start"]),
+                                (RuntimeError("reflex"), ["stop"])):
+            events, _ = self.teleop()
+            with patch.object(self.backend, "_restore_home", side_effect=error):
+                with self.assertRaises(type(error)):
+                    self.backend.restore_joints()
+            self.assertEqual(events, expected)
+            patch.stopall()
+
+    def test_teleop_failed_save_preserves_config_and_resumes(self):
+        events, _ = self.teleop()
+        self.stub.write_text(f"#!{sys.executable}\nimport sys\nsys.exit('save home refused: F3 held')\n")
+        with self.assertRaises(Rejected):
+            self.backend.save_home("demo")
+        self.assertEqual(events, ["stop", "start"])
+        self.assertEqual(self.config.read_bytes(), self.original)
+
+    def test_resume_failure_propagates_as_fault(self):
+        self.teleop()
+        self.start.side_effect = RuntimeError("bridge restart failed")
+        with patch.object(self.backend, "_restore_home"):
+            with self.assertRaisesRegex(RuntimeError, "bridge restart failed"):
+                self.backend.restore_joints()
+
+    def test_teleop_dry_run_never_commands_real_home(self):
+        events, _ = self.teleop()
+        self.backend._dry_run = True
+        with patch.object(self.backend, "_restore_home") as home:
+            with self.assertRaises(Rejected):
+                self.backend.restore_joints()
+            home.assert_not_called()
+        self.assertEqual(events, [])
+
+    def test_session_allows_released_teleop_home_and_reports_busy(self):
+        loop = ControlLoop(self.backend)
+        loop.state.phase, loop.state.mode = Phase.READY, Mode.TELEOP
+        loop.state.config_name = "demo"
+        def save(name):
+            self.assertTrue(loop.snapshot().to_json()["home_busy"])
+            return {"config_name": name, "q": Q}
+        with patch.object(self.backend, "save_home", side_effect=save):
+            loop._apply(Command("save_home", {"config_name": "demo"}))
+        self.assertFalse(loop.state.home_busy)
+        self.assertEqual(loop.state.saved_home["q"], Q)
+        with patch.object(self.backend, "restore_joints") as restore:
+            loop._apply(Command("restore_joints"))
+            restore.assert_called_once()
+        self.assertEqual(loop.state.phase, Phase.READY)
+
+    def test_session_rejects_held_or_mapping_for_both_actions(self):
+        loop = ControlLoop(self.backend)
+        loop.state.phase, loop.state.mode = Phase.READY, Mode.TELEOP
+        loop.state.config_name = "demo"
+        for held, enabled in ((True, False), (False, True)):
+            loop.state.deadman_held, loop.state.stream_enabled = held, enabled
+            for name in ("save_home", "restore_joints"):
+                with patch.object(self.backend, name) as action:
+                    with self.assertRaises(Rejected):
+                        loop._apply(Command(name, {"config_name": "demo"}))
+                    action.assert_not_called()
 
     def test_mock_cannot_persist_simulated_pose(self):
         loop = ControlLoop(MockBackend(config_dir=self.conf))

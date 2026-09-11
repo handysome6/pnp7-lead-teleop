@@ -1,0 +1,16 @@
+{
+  "base_commit": "fbc01498e4d5d45102462aac63e8532e2ea918ea",
+  "scope": "working tree including pre-existing uncommitted changes; no hardware access; no real episodes available",
+  "sha256": {
+    "/Users/andyliu/workspace/vla_data_collect/pnp7-lead-teleop/src/pnp7_teleop.cpp": "adf3d84aa6d9e94203ca185a6c10a3f1fbb9d414ed895d6759998d845ea45e1f",
+    "/Users/andyliu/workspace/vla_data_collect/pnp7-lead-teleop/collect/build_episode.py": "440bb820c75f7aecf67120e346a1877e4bff2dd36136676c532ec0a457647854",
+    "/Users/andyliu/workspace/vla_data_collect/pnp7-lead-teleop/collect/export_lerobot.py": "c754eb020ad465f527f5262f079fd987c61ce9799393c1c268d092f7264e8f2e",
+    "/Users/andyliu/workspace/vla_data_collect/pnp7-lead-teleop/collect/validate_episode.py": "8d3448320b3418531582d369a020538daab187e59f0ec7964070d17e368079db",
+    "/Users/andyliu/workspace/vla_data_collect/pnp7-lead-teleop/collect/record_cameras.py": "4bfd22ce2cc7f35162583d9c6a61c2bd5ecd9809e82b3261fc563fd78231ec56",
+    "/Users/andyliu/workspace/vla_data_collect/pnp7-lead-teleop/collect/prune_episode.py": "915045f64eb1da76051d0fe2bb93fdf35be4af29c15a0264037f9b441340397f",
+    "/Users/andyliu/workspace/vla_data_collect/pnp7-lead-teleop/gui/legacy_backend.py": "a19258d134e7d649a454132fc14873fb4ad7f57e867d48012dc2d954acb5fa83",
+    "/Users/andyliu/workspace/vla_data_collect/pnp7-lead-teleop/event_camera/record_events.py": "03a0afc3b0ed39efb9eabc4dede4d2ed0b11e2a9f3036f589ba4c6822bd15a55",
+    "/Users/andyliu/workspace/vla_data_collect/pnp7-lead-teleop/inference/pnp7_policy.py": "22db6150c386f60b080a2f59ef0080b5d9c909979ed417a18f60019bb38152d7",
+    "/Users/andyliu/workspace/vla_data_collect/training/convert_to_lerobot.py": "13b83c5ff32a0d48802d4f7e0e3b47f3fcc1ae3a445ab55602c5f80292235a9d"
+  }
+}

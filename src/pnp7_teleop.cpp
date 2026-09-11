@@ -16,9 +16,11 @@
 #include <franka/robot.h>
 
 #include "dynamixel_sdk.h"
+#include "robotiq.hpp"
 
 #include <fcntl.h>
 #include <linux/input.h>
+#include <sched.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -51,6 +53,14 @@ constexpr int kGripperIndex = 7;
 
 constexpr double kPi = 3.14159265358979323846;
 
+// libfranka 0.21.3 defaults limit_rate to false. Keep our conservative motion
+// generator, then let the SDK bound the final wire command relative to the
+// robot's accepted q_d/dq_d/ddq_d, including after a missed control packet.
+constexpr bool kFciLimitRate = true;
+constexpr double kFciCutoffHz = franka::kDefaultCutoffFrequency;
+// A reflex can brake for longer than the default 50-frame log covers.
+constexpr size_t kFrankaLogSize = 5000;
+
 // Dynamixel X-series control table.
 constexpr int kAddrPresentVelocity = 128;
 constexpr int kLenVelPos = 8;   // 128..135 = velocity(4) + position(4)
@@ -82,6 +92,30 @@ constexpr std::array<double, kNumJoints> kQMax = {
 constexpr double kJointLimitMargin = 0.10;  // rad
 
 std::atomic<bool> g_interrupted{false};
+
+void requireRealtimeScheduling() {
+  sched_param param{};
+  const int policy = sched_getscheduler(0);
+  if (sched_getparam(0, &param) != 0 || policy != SCHED_FIFO || param.sched_priority < 1) {
+    throw std::runtime_error(
+        "preflight refused: FCI thread has no SCHED_FIFO priority. Grant this user "
+        "rtprio 99 and start a fresh login/GUI session. kIgnore bypasses the "
+        "kernel check only; running the control thread as SCHED_OTHER is refused.");
+  }
+  std::cout << "FCI scheduling: SCHED_FIFO priority=" << param.sched_priority
+            << " (kernel check bypassed)\n" << std::flush;
+}
+
+// std::thread inherits its creator's scheduler. USB reads, status-file writes
+// and gripper I/O must not inherit the FCI thread's FIFO 99 priority.
+bool configureBackgroundThread() {
+  sched_param param{};
+  if (sched_setscheduler(0, SCHED_OTHER, &param) == 0) return true;
+  std::cerr << "cannot set background thread to SCHED_OTHER: "
+            << std::strerror(errno) << '\n';
+  g_interrupted.store(true);
+  return false;
+}
 
 int64_t monotonicNs() {
   timespec ts{};
@@ -128,6 +162,11 @@ struct Config {
   std::array<bool, kNumJoints> enabled{{false, false, false, false, false, false, true}};
 
   bool gripper_enabled{false};
+  std::string gripper_type{"franka"};
+  std::string robotiq_port;
+  int robotiq_slave{9};
+  int robotiq_speed{32};  // raw register, not m/s
+  int robotiq_force{0};   // minimum force register, not zero physical force
   int gripper_ticks_closed{649};
   int gripper_ticks_open{1355};
   double gripper_speed{0.10};
@@ -273,6 +312,18 @@ void validateConfig(const Config& c) {
   }
   if (std::none_of(c.enabled.begin(), c.enabled.end(), [](bool b) { return b; }))
     throw std::invalid_argument("no joints enabled");
+  if (c.gripper_type != "franka" && c.gripper_type != "robotiq")
+    throw std::invalid_argument("gripper_type must be franka or robotiq");
+  if (c.gripper_enabled && c.gripper_type == "robotiq") {
+    if (c.robotiq_port.empty() || c.robotiq_slave < 1 || c.robotiq_slave > 247 ||
+        c.robotiq_speed < 0 || c.robotiq_speed > 255 ||
+        c.robotiq_force < 0 || c.robotiq_force > 255)
+      throw std::invalid_argument("invalid Robotiq port/slave/speed/force");
+    char lead_real[4096]{}, grip_real[4096]{};
+    if (realpath(c.lead_port.c_str(), lead_real) && realpath(c.robotiq_port.c_str(), grip_real) &&
+        std::strcmp(lead_real, grip_real) == 0)
+      throw std::invalid_argument("Robotiq and GELLO cannot share a serial port");
+  }
   if (c.gripper_enabled) {
     if (c.gripper_ticks_closed == c.gripper_ticks_open)
       throw std::invalid_argument("gripper closed and open ticks are equal");
@@ -324,6 +375,11 @@ Config loadConfig(const std::string& path) {
       fillPerJoint(c.max_joint_acceleration, value, "max_joint_acceleration");
     else if (key == "max_session_delta") c.max_session_delta = std::stod(value);
     else if (key == "watchdog_ms") c.watchdog_ms = std::stoi(value);
+    else if (key == "gripper_type") c.gripper_type = value;
+    else if (key == "robotiq_port") c.robotiq_port = value;
+    else if (key == "robotiq_slave") c.robotiq_slave = std::stoi(value);
+    else if (key == "robotiq_speed") c.robotiq_speed = std::stoi(value);
+    else if (key == "robotiq_force") c.robotiq_force = std::stoi(value);
     else if (key == "gripper_enabled") c.gripper_enabled = std::stoi(value) != 0;
     else if (key == "gripper_ticks_closed")
       c.gripper_ticks_closed = std::stoi(value);
@@ -377,7 +433,16 @@ struct LeadSnapshot {
   std::array<int32_t, kNumServos> ticks{};
 };
 
-// Sampled on its own thread; the FCI callback only reads `snapshot()`.
+// A realtime reader must never wait for the lower-priority USB worker. Keep
+// the last coherent sample if publication is interrupted while holding the lock.
+bool tryCopyLeadSnapshot(std::mutex& mutex, const LeadSnapshot& latest, LeadSnapshot& out) {
+  std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
+  if (!lock.owns_lock()) return false;
+  out = latest;
+  return true;
+}
+
+// Sampled on its own thread; the FCI callback uses nonblocking trySnapshot().
 class LeadArmReader {
  public:
   explicit LeadArmReader(const Config& config) : config_(config) {}
@@ -467,6 +532,7 @@ class LeadArmReader {
   void start() {
     running_.store(true);
     thread_ = std::thread([this] {
+      if (!configureBackgroundThread()) return;
       while (running_.load()) readOnce();
     });
   }
@@ -479,6 +545,10 @@ class LeadArmReader {
   LeadSnapshot snapshot() {
     std::lock_guard<std::mutex> lock(mutex_);
     return latest_;
+  }
+
+  bool trySnapshot(LeadSnapshot& out) {
+    return tryCopyLeadSnapshot(mutex_, latest_, out);
   }
 
   int64_t lastGoodNs() const { return last_good_ns_.load(); }
@@ -527,8 +597,11 @@ bool testBit(const unsigned long* bits, int bit) {
 bool keyHeldNow(int fd, int key_code) {
   unsigned long bits[(KEY_MAX + 8 * sizeof(unsigned long)) /
                      (8 * sizeof(unsigned long))]{};
-  return ioctl(fd, EVIOCGKEY(sizeof(bits)), bits) >= 0 &&
-         testBit(bits, key_code);
+  if (ioctl(fd, EVIOCGKEY(sizeof(bits)), bits) < 0) {
+    throw std::runtime_error("cannot read foot brake key state: " +
+                             std::string(std::strerror(errno)));
+  }
+  return testBit(bits, key_code);
 }
 
 // Hold-to-enable on one key of a dedicated input device. A press is only
@@ -617,6 +690,7 @@ class DeadmanReader {
   void start() {
     running_.store(true);
     thread_ = std::thread([this] {
+      if (!configureBackgroundThread()) return;
       while (running_.load()) {
         poll();
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -863,10 +937,14 @@ class StatusPublisher {
     lead_age_ms_.store(lead_age_ms);
   }
 
+  void updateGripper(int position, int requested, int fault, int object) {
+    grip_raw_=position; grip_requested_raw_=requested; grip_fault_=fault; grip_object_=object;
+  }
   void start() {
     if (path_.empty()) return;
     running_.store(true);
     thread_ = std::thread([this] {
+      if (!configureBackgroundThread()) return;
       while (running_.load()) {
         std::ostringstream out;
         out << std::fixed << std::setprecision(4);
@@ -876,6 +954,10 @@ class StatusPublisher {
             << ",\"lead_age_ms\":" << lead_age_ms_.load()
             << ",\"gripper_width\":" << grip_w_.load()
             << ",\"gripper_target\":" << grip_t_.load()
+            << ",\"gripper_position_raw\":" << grip_raw_.load()
+            << ",\"gripper_requested_raw\":" << grip_requested_raw_.load()
+            << ",\"gripper_fault\":" << grip_fault_.load()
+            << ",\"gripper_object\":" << grip_object_.load()
             << ",\"q\":[";
         for (int i = 0; i < kNumJoints; ++i)
           out << (i ? "," : "") << q_[i].load();
@@ -912,10 +994,65 @@ class StatusPublisher {
   std::array<std::atomic<double>, kNumJoints> target_{};
   std::atomic<double> grip_w_{-1.0};
   std::atomic<double> grip_t_{-1.0};
+  std::atomic<int> grip_raw_{-1},grip_requested_raw_{-1},grip_fault_{-1},grip_object_{-1};
   std::atomic<int64_t> lead_seq_{0};
   std::atomic<double> lead_age_ms_{0.0};
   std::atomic<bool> running_{false};
   std::thread thread_;
+};
+
+// Finish only after the robot's accepted command has settled, not merely the
+// unfiltered local generator. A reflex is never reported as normal completion.
+class MotionFinishGuard {
+ public:
+  bool update(bool requested, bool generator_stopped,
+              const std::array<double, kNumJoints>& command,
+              const franka::RobotState& state, double dt) {
+    bool settled = requested && generator_stopped && !state.current_errors &&
+                   std::isfinite(dt) && dt > 0.0 && dt <= 0.002;
+    for (int j = 0; j < kNumJoints && settled; ++j) {
+      settled = std::isfinite(command[j]) && std::isfinite(state.q_d[j]) &&
+                std::isfinite(state.dq_d[j]) && std::isfinite(state.ddq_d[j]) &&
+                std::isfinite(state.dq[j]) &&
+                std::abs(command[j] - state.q_d[j]) < 1e-6 &&
+                std::abs(state.dq_d[j]) < 1e-4 &&
+                std::abs(state.ddq_d[j]) < 1e-2 && std::abs(state.dq[j]) < 1e-2;
+    }
+    settled_s_ = settled ? settled_s_ + dt : 0.0;
+    return settled_s_ >= 0.1;
+  }
+ private:
+  double settled_s_{0.0};
+};
+
+// A delayed callback can still carry a 1 ms robot period: the stale state is
+// delivered first, followed by a 5 ms jump (observed in ep027 and ep028).
+// Check host time as well as robot time before sending another command. Throwing
+// exits via libfranka's cancelMotion/StopMove path; it never clears robot faults.
+class ControlDeadlineGuard {
+ public:
+  void enter(int64_t now, double robot_period_s, uint64_t robot_time_ms) {
+    const int64_t gap = last_entry_ ? now - last_entry_ : 0;
+    last_entry_ = now;
+    if (gap > 3000000 || robot_period_s > 0.003) {
+      std::ostringstream detail;
+      detail << "FCI timing guard: host_gap_ms=" << gap / 1e6
+             << " robot_period_ms=" << robot_period_s * 1000.0
+             << " robot_time_ms=" << robot_time_ms
+             << " -- stale joint command cancelled";
+      throw std::runtime_error(detail.str());
+    }
+  }
+  void commandReady(int64_t now) const {
+    if (now - last_entry_ > 1000000) {
+      std::ostringstream detail;
+      detail << "FCI timing guard: callback_work_ms=" << (now - last_entry_) / 1e6
+             << " -- late joint command cancelled";
+      throw std::runtime_error(detail.str());
+    }
+  }
+ private:
+  int64_t last_entry_{0};
 };
 
 // ------------------------------------------------------------- gripper ----
@@ -925,7 +1062,27 @@ class StatusPublisher {
 // from the 1 kHz callback; and per roadmap section 7 the hand does not need
 // servo-rate updates -- a new command is only issued once the operator's
 // trigger has moved past a deadband.
-class GripperController {
+class GripperInterface {
+ public:
+  virtual ~GripperInterface() = default;
+  virtual void connect() = 0;
+  virtual void start() = 0;
+  virtual void stop() = 0;
+  virtual void setTargetTicks(int32_t ticks) = 0;
+  virtual void pause() {} // Legacy Franka Hand behaviour retained.
+  virtual double width() const = 0;
+  virtual double target() const = 0;
+  virtual int64_t commands() const = 0;
+  virtual int64_t preemptions() const { return 0; }
+  virtual int64_t errors() const { return 0; }
+  virtual bool healthy() const { return true; }
+  virtual std::string failure() const { return ""; }
+  virtual int rawPosition() const { return -1; }
+  virtual int rawRequested() const { return -1; }
+  virtual int fault() const { return -1; }
+  virtual int object() const { return -1; }
+};
+class GripperController : public GripperInterface {
  public:
   GripperController(const std::string& ip, const Config& config)
       : config_(config), gripper_(ip) {}
@@ -997,6 +1154,7 @@ class GripperController {
     // Mover: owns the blocking call. franka::Gripper::move does not return
     // until the hand has finished travelling, so nothing else can live here.
     move_thread_ = std::thread([this] {
+      if (!configureBackgroundThread()) return;
       while (running_.load()) {
         const double want = target_.load();
         const bool changed =
@@ -1034,6 +1192,7 @@ class GripperController {
     // mistake is what made the first attempt useless: the check ran a few
     // times a second, long after the stale move had already finished.
     preempt_thread_ = std::thread([this] {
+      if (!configureBackgroundThread()) return;
       while (running_.load()) {
         if (move_active_.load() && !preempted_.load() &&
             std::fabs(target_.load() - commanded_.load()) >=
@@ -1052,6 +1211,7 @@ class GripperController {
 
     // State reader, kept apart because readOnce() blocks on the next datagram.
     state_thread_ = std::thread([this] {
+      if (!configureBackgroundThread()) return;
       while (running_.load()) {
         try {
           width_.store(gripper_.readOnce().width);
@@ -1098,6 +1258,49 @@ class GripperController {
   std::thread state_thread_;
 };
 
+class RobotiqGripperController : public GripperInterface {
+ public:
+  explicit RobotiqGripperController(const Config& config)
+      : config_(config), driver_(config.robotiq_port, config.robotiq_slave,
+                                config.robotiq_speed, config.robotiq_force) {}
+  void connect() override {
+    driver_.connect();
+    want_open_ = driver_.position() < 128;
+    std::cout << "Robotiq connected: port=" << config_.robotiq_port
+              << " position_raw=" << driver_.position()
+              << " model=2F-unconfirmed units=raw_counts speed=" << config_.robotiq_speed
+              << " force=" << config_.robotiq_force << "\n" << std::flush;
+  }
+  void start() override { driver_.start(); }
+  void stop() override { driver_.stop(); }
+  void pause() override { driver_.pause(); }
+  void setTargetTicks(int32_t ticks) override {
+    const double fraction = std::clamp(double(ticks-config_.gripper_ticks_closed) /
+        (config_.gripper_ticks_open-config_.gripper_ticks_closed), 0.0, 1.0);
+    if (config_.gripper_binary) {
+      if (fraction > config_.gripper_binary_threshold+0.08) want_open_=true;
+      if (fraction < config_.gripper_binary_threshold-0.08) want_open_=false;
+      driver_.request(want_open_ ? 0 : 255);
+    } else driver_.request(int(std::lround((1.0-fraction)*255.0)));
+  }
+  // No calibrated width is available. Do not poison metre-valued observations
+  // or datasets by guessing a 2F model or treating raw counts as millimetres.
+  double width() const override { return -1.0; }
+  double target() const override { return -1.0; }
+  int64_t commands() const override { return driver_.commands(); }
+  int64_t errors() const override { return driver_.healthy() ? 0 : 1; }
+  bool healthy() const override { return driver_.healthy(); }
+  std::string failure() const override { return driver_.failure(); }
+  int rawPosition() const override { return driver_.position(); }
+  int rawRequested() const override { return driver_.requested(); }
+  int fault() const override { return driver_.fault(); }
+  int object() const override { return driver_.object(); }
+ private:
+  Config config_;
+  robotiq::Controller driver_;
+  bool want_open_{true};
+};
+
 // ---------------------------------------------------------------- log -----
 
 struct LogRow {
@@ -1117,12 +1320,14 @@ struct LogRow {
   std::array<double, 6> O_F_ext;   // external wrench estimate, base frame
   double gripper_width;
   double gripper_target;
+  int gripper_position_raw{-1}, gripper_requested_raw{-1}, gripper_fault{-1};
 };
 
 void writeLog(const std::string& path, const std::vector<LogRow>& rows,
-              size_t count) {
+              size_t count, size_t begin = 0) {
   if (path.empty()) return;
   std::ofstream out(path);
+  out.exceptions(std::ios::failbit | std::ios::badbit);
   out << "t_ns,dt_s,lead_seq,state,deadman";
   for (int i = 0; i < kNumJoints; ++i) out << ",q_robot" << i;
   for (int i = 0; i < kNumJoints; ++i) out << ",q_target" << i;
@@ -1131,9 +1336,9 @@ void writeLog(const std::string& path, const std::vector<LogRow>& rows,
   for (int i = 0; i < kNumJoints; ++i) out << ",tau_robot" << i;
   for (int i = 0; i < 16; ++i) out << ",O_T_EE" << i;
   for (int i = 0; i < 6; ++i) out << ",O_F_ext" << i;
-  out << ",gripper_ticks,gripper_width,gripper_target\n";
-  out << std::setprecision(10);
-  for (size_t r = 0; r < count; ++r) {
+  out << ",gripper_ticks,gripper_width,gripper_target,gripper_position_raw,gripper_requested_raw,gripper_fault\n";
+  out << std::setprecision(17);
+  for (size_t r = begin; r < count; ++r) {
     const LogRow& row = rows[r];
     out << row.t_ns << "," << row.dt_s << "," << row.lead_seq << ","
         << row.state << "," << row.deadman;
@@ -1145,9 +1350,44 @@ void writeLog(const std::string& path, const std::vector<LogRow>& rows,
     for (int i = 0; i < 16; ++i) out << "," << row.O_T_EE[i];
     for (int i = 0; i < 6; ++i) out << "," << row.O_F_ext[i];
     out << "," << row.gripper_ticks << "," << row.gripper_width << ","
-        << row.gripper_target << "\n";
+        << row.gripper_target << "," << row.gripper_position_raw << ","
+        << row.gripper_requested_raw << "," << row.gripper_fault << "\n";
   }
-  std::cout << "log written: " << path << " (" << count << " rows)\n";
+  out.close();
+  std::cout << "log written: " << path << " (" << count - begin << " rows)\n";
+}
+
+// Preserve double precision: rounding positions to six significant digits can
+// itself look like an acceleration jump when differenced at 1 kHz. Commands
+// are timestamp n and their corresponding states n+1 (libfranka Record).
+void writeFrankaDiagnostic(std::ostream& out, const std::vector<franka::Record>& log) {
+  out << "time,success_rate,robot_mode,current_errors,last_motion_errors";
+  for (const char* name : {"state.q", "state.q_d", "state.dq", "state.dq_d",
+                           "state.ddq_d", "cmd.q_d"}) {
+    for (int i = 0; i < kNumJoints; ++i) out << ',' << name << '[' << i << ']';
+  }
+  out << '\n' << std::setprecision(17);
+  for (const auto& row : log) {
+    out << row.state.time.toMSec() << ',' << row.state.control_command_success_rate
+        << ',' << static_cast<int>(row.state.robot_mode);
+    // Errors stringify as a JSON-like list with quotes and commas; CSV-escape it.
+    for (const auto* errors : {&row.state.current_errors, &row.state.last_motion_errors}) {
+      std::ostringstream text;
+      text << *errors;
+      out << ",\"";
+      for (char ch : text.str()) {
+        if (ch == '"') out << '"';
+        out << ch;
+      }
+      out << '"';
+    }
+    for (const auto* values : {&row.state.q, &row.state.q_d, &row.state.dq,
+                               &row.state.dq_d, &row.state.ddq_d,
+                               &row.command.joint_positions.q}) {
+      for (double value : *values) out << ',' << value;
+    }
+    out << '\n';
+  }
 }
 
 // --------------------------------------------------------------- modes ----
@@ -1459,8 +1699,9 @@ int runRobot(const Config& config, double duration_s,
                         config.deadman_grab);
   deadman.open();
 
-  // Temporary robot-s0 trial: allow startup without RT scheduling/kernel checks.
-  franka::Robot robot(config.robot_ip, franka::RealtimeConfig::kIgnore);
+  // Temporary non-RT-kernel trial; realtime thread scheduling is still required.
+  franka::Robot robot(config.robot_ip, franka::RealtimeConfig::kIgnore, kFrankaLogSize);
+  requireRealtimeScheduling();
   const franka::RobotState before = robot.readOnce();
   if (before.robot_mode != franka::RobotMode::kIdle) {
     throw std::runtime_error(
@@ -1477,10 +1718,21 @@ int runRobot(const Config& config, double duration_s,
     if (config.enabled[i]) std::cout << " J" << (i + 1);
   std::cout << "  scale=" << config.scale[6] << "\n";
 
-  std::unique_ptr<GripperController> gripper;
+  std::unique_ptr<GripperInterface> gripper;
   if (config.gripper_enabled) {
-    gripper = std::make_unique<GripperController>(config.robot_ip, config);
-    gripper->connect();
+    try {
+      if (config.gripper_type == "robotiq")
+        gripper = std::make_unique<RobotiqGripperController>(config);
+      else gripper = std::make_unique<GripperController>(config.robot_ip, config);
+      gripper->connect();
+    } catch (const franka::Exception& e) {
+      throw std::runtime_error(
+          "Franka Hand 夹爪连接/状态读取失败（" + config.robot_ip +
+          ":1338）。机械臂 FCI 预检查已通过，当前失败来自夹爪。"
+          "请检查 Franka Hand 的连接和 Desk 中的末端配置；"
+          "若实际未使用 Franka Hand，请使用 gripper_enabled=0 的配置。"
+          "原始错误：" + e.what());
+    }
   } else {
     std::cout << "gripper: disabled in config\n";
   }
@@ -1512,13 +1764,20 @@ int runRobot(const Config& config, double duration_s,
   std::array<double, kNumJoints> last_cmd = before.q;
   bool first = true;
 
-  std::cout << "CONTROL_READY hold the SpaceMouse left button to enable\n";
+  std::cout << "FCI conditioning: rate_limit=true cutoff_hz=" << kFciCutoffHz
+            << " diagnostic_frames=" << kFrankaLogSize << "\n";
+  std::cout << "CONTROL_READY hold the foot brake (F3) to enable\n";
 
-  robot.control([&](const franka::RobotState& robot_state,
+  MotionFinishGuard finish_guard;
+  ControlDeadlineGuard deadline_guard;
+  LeadSnapshot latest_lead;
+
+  const auto control_callback = [&](const franka::RobotState& robot_state,
                     franka::Duration period) -> franka::JointPositions {
     const double dt = period.toSec() > 0.0 ? period.toSec() : 0.001;
     elapsed += dt;
     const int64_t now = monotonicNs();
+    deadline_guard.enter(now, period.toSec(), robot_state.time.toMSec());
 
     if (first) {
       // First command must be the measured pose, so control starts continuous.
@@ -1526,10 +1785,12 @@ int runRobot(const Config& config, double duration_s,
       q_origin = robot_state.q;
       last_cmd = robot_state.q;
       first = false;
+      deadline_guard.commandReady(monotonicNs());
       return franka::JointPositions(robot_state.q);
     }
 
-    LeadSnapshot snap = lead.snapshot();
+    lead.trySnapshot(latest_lead);
+    LeadSnapshot snap = latest_lead;
     {
       std::array<double, kNumServos> t{};
       for (int i = 0; i < kNumServos; ++i) t[i] = snap.ticks[i];
@@ -1537,8 +1798,9 @@ int runRobot(const Config& config, double duration_s,
       for (int i = 0; i < kNumServos; ++i)
         snap.ticks[i] = static_cast<int32_t>(std::llround(t[i]));
     }
-    const bool fresh = snap.seq > 0 && (now - lead.lastGoodNs()) < watchdog_ns;
-    const bool want_stop = g_interrupted.load() || elapsed >= duration_s;
+    const bool fresh = snap.seq > 0 && (now - snap.t_ns) < watchdog_ns;
+    const bool want_stop = g_interrupted.load() || elapsed >= duration_s ||
+                           (gripper && !gripper->healthy()) || static_cast<bool>(robot_state.current_errors);
     const bool enable = deadman.pressed() && fresh && !want_stop;
 
     std::array<double, kNumJoints> delta{};
@@ -1558,8 +1820,9 @@ int runRobot(const Config& config, double duration_s,
 
     // The hand only needs a new setpoint; the blocking move happens on the
     // gripper thread.
-    if (gripper && state == State::kTeleop) {
-      gripper->setTargetTicks(snap.ticks[kGripperIndex]);
+    if (gripper) {
+      if (enable) gripper->setTargetTicks(snap.ticks[kGripperIndex]);
+      else gripper->pause();
     }
 
     if (count < rows.size()) {
@@ -1579,22 +1842,45 @@ int runRobot(const Config& config, double duration_s,
       row.O_F_ext = robot_state.O_F_ext_hat_K;
       row.gripper_width = gripper ? gripper->width() : -1.0;
       row.gripper_target = gripper ? gripper->target() : -1.0;
+      row.gripper_position_raw = gripper ? gripper->rawPosition() : -1;
+      row.gripper_requested_raw = gripper ? gripper->rawRequested() : -1;
+      row.gripper_fault = gripper ? gripper->fault() : -1;
     }
 
+    if (gripper) status.updateGripper(gripper->rawPosition(), gripper->rawRequested(),
+                                      gripper->fault(), gripper->object());
     status.update(static_cast<int>(state), deadman.pressed(), robot_state.q,
                   cmd, gripper ? gripper->width() : -1.0,
                   gripper ? gripper->target() : -1.0, snap.seq,
-                  (now - lead.lastGoodNs()) / 1e6);
+                  (now - snap.t_ns) / 1e6);
 
     last_cmd = cmd;
     franka::JointPositions output(cmd);
-    // Only finish once hold() has actually brought every joint to rest.
-    // Finishing mid-motion makes libfranka throw on a non-zero final velocity.
-    if (want_stop && chain.isStopped()) {
-      output.motion_finished = true;
-    }
+    output.motion_finished = finish_guard.update(want_stop, chain.isStopped(),
+                                                  cmd, robot_state, dt);
+    deadline_guard.commandReady(monotonicNs());
     return output;
-  });
+  };
+  try {
+    robot.control(control_callback, franka::ControllerMode::kJointImpedance,
+                  kFciLimitRate, kFciCutoffHz);
+  } catch (...) {
+    if (gripper) gripper->stop();
+    // The control loop has exited. Preserve the raw generator output and
+    // callback periods too; SDK logs contain only the conditioned wire command.
+    // Keep a failed recording in full, or the last 5000 samples in teleop-only.
+    try {
+      const std::string failed_path = log_path.empty()
+          ? "/tmp/pnp7_control_error_" + std::to_string(monotonicNs()) + ".csv"
+          : log_path;
+      writeLog(failed_path, rows, count,
+               log_path.empty() && count > kFrankaLogSize ? count - kFrankaLogSize : 0);
+      std::cerr << "Control callback diagnostic log: " << failed_path << "\n";
+    } catch (const std::exception& log_error) {
+      std::cerr << "cannot save control callback log: " << log_error.what() << "\n";
+    }
+    throw;
+  }
 
   lead.stop();
   deadman.stop();
@@ -1606,6 +1892,8 @@ int runRobot(const Config& config, double duration_s,
               << " errors=" << gripper->errors() << "\n";
   }
   writeLog(log_path, rows, count);
+  if (gripper && !gripper->healthy())
+    throw std::runtime_error("Robotiq 夹爪故障，遥操已停止：" + gripper->failure());
   std::cout << "teleop finished. lead read_failures=" << lead.readFailures()
             << " rejected_jumps=" << lead.rejectedJumps() << "\n";
   return 0;
@@ -1613,9 +1901,32 @@ int runRobot(const Config& config, double duration_s,
 
 void handleSignal(int) { g_interrupted.store(true); }
 
+// Recheck the physical key after the GUI has released the teleop bridge.
+// Its last status sample can lag a press, or reflect the startup release latch.
+void requireHomePedalReleased(const Config& config, const std::string& action) {
+  if (config.deadman_device.empty()) return;
+  const int fd = ::open(config.deadman_device.c_str(), O_RDONLY | O_NONBLOCK);
+  if (fd < 0) {
+    throw std::runtime_error(action + " refused: cannot open foot brake " +
+                             config.deadman_device);
+  }
+  bool held;
+  try {
+    held = keyHeldNow(fd, config.deadman_key);
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
+  ::close(fd);
+  if (held) {
+    throw std::runtime_error(action + " refused: the foot brake is held. Release F3 first");
+  }
+}
+
 // Read the real joint pose for the GUI's Save Home action. No control call,
 // gripper connection, GELLO access, or motion command is made in this mode.
 int readHomePose(const Config& config) {
+  requireHomePedalReleased(config, "save home");
   franka::Robot robot(config.robot_ip, franka::RealtimeConfig::kIgnore);
   const auto state = robot.readOnce();
   if (state.robot_mode != franka::RobotMode::kIdle) {
@@ -1661,24 +1972,7 @@ int runHome(const Config& config) {
         "in radians, or regenerate the config from calibration.json");
   }
 
-  // The dead-man is checked but never grabbed: home is not teleoperation, and
-  // grabbing would fight a bridge that might still be shutting down. A pedal
-  // held now means the operator has their foot on it expecting teleop, which is
-  // not a moment to start an autonomous move.
-  if (!config.deadman_device.empty()) {
-    const int fd = ::open(config.deadman_device.c_str(), O_RDONLY | O_NONBLOCK);
-    if (fd < 0) {
-      throw std::runtime_error("cannot open deadman device " +
-                               config.deadman_device);
-    }
-    const bool held = keyHeldNow(fd, config.deadman_key);
-    ::close(fd);
-    if (held) {
-      throw std::runtime_error(
-          "home refused: the dead-man is held. Release it first -- this move "
-          "is not teleoperation and must not start under a held pedal");
-    }
-  }
+  requireHomePedalReleased(config, "home");
 
   // Clamp into the same envelope the safety chain enforces, so home can never
   // ask for a pose teleoperation would refuse to hold.
@@ -1690,7 +1984,8 @@ int runHome(const Config& config) {
   }
 
   // Match robot mode during the temporary robot-s0 non-RT trial.
-  franka::Robot robot(config.robot_ip, franka::RealtimeConfig::kIgnore);
+  franka::Robot robot(config.robot_ip, franka::RealtimeConfig::kIgnore, kFrankaLogSize);
+  requireRealtimeScheduling();
   const franka::RobotState before = robot.readOnce();
   if (before.robot_mode != franka::RobotMode::kIdle) {
     throw std::runtime_error(
@@ -1739,10 +2034,13 @@ int runHome(const Config& config) {
   bool stopping = false;
   double s_param = 0.0;
 
-  robot.control([&](const franka::RobotState&,
+  MotionFinishGuard finish_guard;
+  ControlDeadlineGuard deadline_guard;
+  robot.control([&](const franka::RobotState& robot_state,
                     franka::Duration period) -> franka::JointPositions {
     const double dt = period.toSec();
-    if (g_interrupted.load()) stopping = true;
+    deadline_guard.enter(monotonicNs(), dt, robot_state.time.toMSec());
+    if (g_interrupted.load() || robot_state.current_errors) stopping = true;
     if (stopping) rate = std::max(0.0, rate - dt / kStopS);
 
     s_param = std::min(1.0, s_param + rate * dt / duration);
@@ -1754,13 +2052,12 @@ int runHome(const Config& config) {
       q[i] = start[i] + (target[i] - start[i]) * poly;
 
     franka::JointPositions output(q);
-    // Both endings are at rest: s_param saturates at 1 where the quintic's
-    // derivative is zero, and the interrupt path stops advancing it at all.
-    if (s_param >= 1.0 || (stopping && rate <= 0.0)) {
-      output.motion_finished = true;
-    }
+    const bool generator_done = s_param >= 1.0 || (stopping && rate <= 0.0);
+    output.motion_finished = finish_guard.update(generator_done, generator_done,
+                                                  q, robot_state, dt);
+    deadline_guard.commandReady(monotonicNs());
     return output;
-  });
+  }, franka::ControllerMode::kJointImpedance, kFciLimitRate, kFciCutoffHz);
 
   if (stopping && s_param < 1.0) {
     std::cout << "HOME_INTERRUPTED at " << (s_param * 100.0) << "%\n";
@@ -1770,9 +2067,47 @@ int runHome(const Config& config) {
   return 0;
 }
 
+int runRobotiq(const Config& config, const std::string& mode, int seconds) {
+  if (config.gripper_type != "robotiq") throw std::runtime_error("requires gripper_type=robotiq");
+  if (mode == "robotiq-init") {
+    robotiq::Port port(config.robotiq_port, config.robotiq_slave);
+    const auto state=robotiq::initialize(port, [] { return g_interrupted.load(); });
+    std::cout << "ROBOTIQ_INIT_OK position_raw=" << int(state.position) << "\n";
+    return 0;
+  }
+  RobotiqGripperController gripper(config);
+  gripper.connect();
+  if (mode == "robotiq-check") return 0;
+  LeadArmReader lead(config); lead.open(); lead.assertTorqueDisabled();
+  DeadmanReader pedal(config.deadman_device, config.deadman_key, config.deadman_grab);
+  pedal.open(); lead.start(); pedal.start(); gripper.start();
+  std::cout << "ROBOTIQ_TEST_READY: only gripper; release then hold foot brake to enable GELLO trigger\n" << std::flush;
+  const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(seconds);
+  auto next=std::chrono::steady_clock::now();
+  while(!g_interrupted.load() && std::chrono::steady_clock::now()<end && gripper.healthy()) {
+    auto snap=lead.snapshot();
+    if(pedal.pressed() && snap.seq>0 && monotonicNs()-lead.lastGoodNs()<config.watchdog_ms*1000000LL)
+      gripper.setTargetTicks(snap.ticks[kGripperIndex]);
+    else gripper.pause();
+    if(std::chrono::steady_clock::now()>=next) {
+      std::cout << "pedal=" << pedal.pressed() << " trigger=" << snap.ticks[kGripperIndex]
+                << " position_raw=" << gripper.rawPosition() << " requested_raw=" << gripper.rawRequested()
+                << " fault=" << gripper.fault() << "\n" << std::flush;
+      next=std::chrono::steady_clock::now()+std::chrono::milliseconds(200);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  gripper.stop(); pedal.stop(); lead.stop();
+  if(!gripper.healthy()) throw std::runtime_error(gripper.failure());
+  return 0;
+}
+
 void printUsage(const char* program) {
   std::cout << "usage:\n"
             << "  " << program << " selftest <config>\n"
+            << "  " << program << " robotiq-check <config> (no motion)\n"
+            << "  " << program << " robotiq-init <config> (automatic finger calibration)\n"
+            << "  " << program << " robotiq-test <config> [seconds] (foot brake + GELLO, no arm)\n"
             << "  " << program << " home <config>\n"
             << "  " << program << " read-home <config>  (read only)\n"
             << "  " << program << " dry <config> <seconds> [log.csv]\n"
@@ -1793,6 +2128,11 @@ int main(int argc, char** argv) {
     const std::string mode = argv[1];
     const Config config = loadConfig(argv[2]);
 
+    if (mode == "robotiq-init" || mode == "robotiq-check" || mode == "robotiq-test") {
+      int seconds=argc>3 ? std::stoi(argv[3]) : 30;
+      if(seconds<1 || seconds>120) throw std::runtime_error("Robotiq test duration must be 1..120 seconds");
+      return runRobotiq(config,mode,seconds);
+    }
     if (mode == "selftest") return runSelfTest(config);
     if (mode == "home") return runHome(config);
     if (mode == "read-home") return readHomePose(config);
@@ -1813,6 +2153,35 @@ int main(int argc, char** argv) {
 
     printUsage(argv[0]);
     return 2;
+  } catch (const franka::ControlException& e) {
+    std::cerr << "franka error: " << e.what() << "\n";
+    // libfranka's exception message reports the end of reflex braking. Its
+    // success rate can have recovered to 1 by then; report the onset separately.
+    const auto onset = std::find_if(e.log.begin(), e.log.end(), [](const auto& row) {
+      return static_cast<bool>(row.state.current_errors);
+    });
+    if (onset != e.log.end()) {
+      std::cerr << "Franka fault onset: robot_time_ms=" << onset->state.time.toMSec()
+                << " success_rate=" << onset->state.control_command_success_rate
+                << " errors=" << onset->state.current_errors << '\n';
+    }
+    // This runs only after the control loop has stopped. Preserve libfranka's
+    // final states and commands even in teleop-only mode, which has no take CSV.
+    if (!e.log.empty()) {
+      const std::string path = "/tmp/pnp7_franka_error_" +
+                               std::to_string(monotonicNs()) + ".csv";
+      try {
+        std::ofstream out(path);
+        out.exceptions(std::ios::failbit | std::ios::badbit);
+        writeFrankaDiagnostic(out, e.log);
+        out.close();
+        std::cerr << "Franka diagnostic log: " << path << " ("
+                  << e.log.size() << " states/commands)\n";
+      } catch (const std::exception& log_error) {
+        std::cerr << "cannot save Franka diagnostic log: " << log_error.what() << "\n";
+      }
+    }
+    return 1;
   } catch (const franka::Exception& e) {
     std::cerr << "franka error: " << e.what() << "\n";
     return 1;

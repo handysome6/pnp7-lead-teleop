@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -31,6 +32,10 @@ class Rejected(Exception):
     which an earlier version did -- aborted the episode the operator was in the
     middle of, turning a misclick into lost data.
     """
+
+
+class EpisodeReflex(RuntimeError):
+    """A collision reflex invalidated this take; no automatic robot recovery."""
 
 
 class Phase(str, Enum):
@@ -76,6 +81,7 @@ class Command:
     #: Set when the loop has applied it, so the HTTP handler can report back.
     done: threading.Event = field(default_factory=threading.Event, repr=False)
     error: str | None = None
+    expires_at: float | None = None
 
 
 @dataclass
@@ -88,6 +94,7 @@ class SessionState:
     error: str | None = None
     message: str = ""
     saved_home: dict[str, Any] | None = None
+    home_busy: bool = False
 
     # --- teleop / safety -------------------------------------------------
     deadman_held: bool = False
@@ -98,10 +105,15 @@ class SessionState:
     #: value is the early warning for a bus going quiet.
     lead_age_ms: float | None = None
     joints: list[float] = field(default_factory=list)
+    gripper_position_raw: int | None = None
+    gripper_requested_raw: int | None = None
+    gripper_fault: int | None = None
     gripper_width: float | None = None
 
     # --- episode bookkeeping --------------------------------------------
-    episode_index: int = 0        # episodes kept this session
+    episode_index: int = 0        # saved episodes in the selected directory/prefix
+    next_episode: str | None = None
+    incomplete_episodes: int = 0
     episode_target: int = 0       # runner.num_data_episodes
     episode_steps: int = 0        # steps appended to the open episode
     episode_segments: int = 0     # F3 intervals within the open episode
@@ -117,18 +129,25 @@ class SessionState:
     def to_json(self) -> dict[str, Any]:
         out = {
             "phase": self.phase.value,
+            "server_time": time.time(),
             "mode": self.mode.value,
             "config_name": self.config_name,
             "error": self.error,
             "message": self.message,
             "saved_home": self.saved_home,
+            "home_busy": self.home_busy,
             "deadman_held": self.deadman_held,
             "stream_enabled": self.stream_enabled,
             "block_reason": self.block_reason,
             "lead_age_ms": self.lead_age_ms,
             "joints": [round(float(q), 5) for q in self.joints],
             "gripper_width": self.gripper_width,
+            "gripper_position_raw": self.gripper_position_raw,
+            "gripper_requested_raw": self.gripper_requested_raw,
+            "gripper_fault": self.gripper_fault,
             "episode_index": self.episode_index,
+            "next_episode": self.next_episode,
+            "incomplete_episodes": self.incomplete_episodes,
             "episode_target": self.episode_target,
             "episode_steps": self.episode_steps,
             "episode_segments": self.episode_segments,
@@ -171,6 +190,10 @@ class Backend:
     def close_session(self) -> None:
         raise NotImplementedError
 
+    def abort_session(self, reason: str) -> None:
+        """Release a failed session without automatically restarting motion."""
+        self.close_session()
+
     # --- per-step ---------------------------------------------------------
     def step(self, recording: bool) -> dict[str, Any]:
         """Advance one control period.
@@ -199,6 +222,12 @@ class Backend:
 
     def end_episode(self, keep: bool) -> dict[str, Any]:
         raise NotImplementedError
+
+    def discard_reflex_episode(self, reason: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def dataset_progress(self) -> dict[str, Any] | None:
+        return None
 
     def finalize_dataset(self) -> dict[str, Any]:
         """Flush LeRobot ``info.json``/``stats.json`` so the shard is loadable."""
@@ -242,6 +271,13 @@ class ControlLoop:
         self._on_state = on_state
         self._t_open = 0.0
         self._step_times: list[float] = []
+        self._refresh_dataset_progress()
+
+    def _refresh_dataset_progress(self) -> None:
+        progress = self.backend.dataset_progress()
+        if progress is not None:
+            for key, value in progress.items():
+                setattr(self.state, key, value)
 
     # --- public API -------------------------------------------------------
     def start(self) -> None:
@@ -254,8 +290,8 @@ class ControlLoop:
         if self._thread is not None:
             self._thread.join(timeout=15)
 
-    def submit(self, name: str, **args) -> Command:
-        cmd = Command(name=name, args=args)
+    def submit(self, name: str, *, _expires_at: float | None = None, **args) -> Command:
+        cmd = Command(name=name, args=args, expires_at=_expires_at)
         with self._lock:
             self._commands.append(cmd)
         return cmd
@@ -301,6 +337,9 @@ class ControlLoop:
         try:
             telemetry = self.backend.step(
                 recording=self.state.phase is Phase.RECORDING)
+        except EpisodeReflex as exc:
+            self._discard_reflex(exc)
+            return
         except Exception as exc:  # noqa: BLE001 - surface it, never crash the loop
             self._fail(f"step failed: {exc}")
             return
@@ -322,7 +361,15 @@ class ControlLoop:
             pending, self._commands = self._commands, []
         for cmd in pending:
             try:
+                if cmd.expires_at is not None and time.time() > cmd.expires_at:
+                    raise Rejected("操作请求已过期，请确认最新页面状态后重新点击")
                 self._apply(cmd)
+            except EpisodeReflex as exc:
+                # Stop & keep may arrive before the next health poll sees the
+                # reflex. It must discard the same way, never keep bad data.
+                self._discard_reflex(exc)
+                if self.state.phase is Phase.ERROR:
+                    cmd.error = self.state.error
             except Rejected as exc:
                 # A guard declined: "not from this phase", "release F3 first".
                 # Expected, and emphatically not a reason to end the take --
@@ -372,6 +419,7 @@ class ControlLoop:
             st.cameras = list(self.backend.camera_names)
             st.phase = Phase.READY
             st.episode_index = 0
+            self._refresh_dataset_progress()
             st.recorded_steps = 0
             st.skipped_steps = 0
             self._t_open = time.monotonic()
@@ -389,12 +437,17 @@ class ControlLoop:
         elif name == "save_home":
             if st.phase not in (Phase.IDLE, Phase.READY):
                 raise Rejected("请先结束录制，再保存 Home")
-            if st.phase is Phase.READY and st.mode is Mode.TELEOP:
-                raise Rejected("请先关闭遥操作会话，再保存 Home")
+            if st.phase is Phase.READY and (st.deadman_held or st.stream_enabled):
+                raise Rejected("请先松开 F3，再保存 Home")
             config_name = cmd.args.get("config_name")
             if st.phase is Phase.READY and config_name != st.config_name:
                 raise Rejected("只能保存到当前会话使用的配置")
-            result = self.backend.save_home(config_name)
+            st.home_busy = True
+            st.message = "正在暂停遥操并读取当前位置…"
+            try:
+                result = self.backend.save_home(config_name)
+            finally:
+                st.home_busy = False
             st.saved_home = result
             st.error = None
             st.message = f"已将当前位置保存至 conf/{result['config_name']}.conf 的 home_qpos"
@@ -405,11 +458,16 @@ class ControlLoop:
             if st.phase is not Phase.READY:
                 raise Rejected(
                     "restore the arm from READY only -- stop the episode first")
-            if st.deadman_held:
+            if st.deadman_held or st.stream_enabled:
                 raise Rejected("release F3 before restoring the arm")
             st.message = "restoring joints..."
-            self.backend.restore_joints(cmd.args.get("qpos"))
-            st.message = "joints restored"
+            st.home_busy = True
+            try:
+                self.backend.restore_joints(cmd.args.get("qpos"))
+            finally:
+                st.home_busy = False
+            st.error = None
+            st.message = "已恢复 Home；松开后重新踩住 F3 可继续遥操"
 
         elif name == "begin_episode":
             if st.mode is Mode.TELEOP:
@@ -417,6 +475,7 @@ class ControlLoop:
             if st.phase is not Phase.READY:
                 raise Rejected(f"cannot start an episode from {st.phase.value}")
             self.backend.begin_episode()
+            self._refresh_dataset_progress()
             st.phase = Phase.RECORDING
             st.episode_steps = 0
             st.episode_segments = 0
@@ -437,9 +496,12 @@ class ControlLoop:
             else:
                 st.message = "episode discarded"
 
+            self._refresh_dataset_progress()
+
         elif name == "finalize_dataset":
             result = self.backend.finalize_dataset()
             st.dataset_dir = result.get("dataset_dir", st.dataset_dir)
+            self._refresh_dataset_progress()
             st.message = f"dataset finalized: {result.get('episodes', 0)} episode(s)"
 
         elif name == "clear_error":
@@ -450,19 +512,52 @@ class ControlLoop:
         else:
             raise Rejected(f"unknown command {name!r}")
 
+    def _discard_reflex(self, exc: EpisodeReflex) -> None:
+        st = self.state
+        if st.phase is not Phase.RECORDING or st.mode is not Mode.COLLECT:
+            self._fail(str(exc))
+            return
+        st.stream_enabled = False
+        st.deadman_held = False
+        st.message = "碰撞保护已停止运动，正在丢弃本条数据…"
+        try:
+            result = self.backend.discard_reflex_episode(str(exc))
+        except Exception as cleanup_error:
+            self._fail(f"丢弃碰撞中止数据失败：{cleanup_error}")
+            return
+        st.phase = Phase.READY
+        st.error = None
+        st.episode_steps = st.episode_segments = 0
+        st.recorded_steps = st.skipped_steps = 0
+        st.cameras = list(self.backend.camera_names)
+        st.block_reason = "本条已丢弃，等待手动开始下一条"
+        st.message = (f"碰撞保护：已丢弃 {result['episode']}，未计入有效数据。"
+                      "请松开 F3、排除接触；如 Desk 提示故障，先确认恢复，再开始下一条。"
+                      f"诊断日志：{result['diagnostic_dir']}")
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {st.message}\n{exc}",
+              file=sys.stderr, flush=True)
+
     def _fail(self, message: str) -> None:
-        self.state.error = message
-        # A failure mid-episode must not silently keep appending frames.
-        if self.state.phase is Phase.RECORDING:
-            try:
-                self.backend.end_episode(keep=False)
-            except Exception:  # noqa: BLE001
-                pass
-            self.state.phase = Phase.READY
+        # Publish the fault before cleanup, which may need time to flush files.
+        with self._lock:
+            self.state.error = message
+            self.state.phase = Phase.ERROR
+            self.state.stream_enabled = False
+            self.state.deadman_held = False
+            self.state.block_reason = "控制故障，已停止"
+            self.state.message = "请查看错误详情；关闭会话并处理故障后再试"
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}",
+              file=sys.stderr, flush=True)
+        try:
+            self.backend.abort_session(message)
+        except Exception as exc:  # noqa: BLE001
+            cleanup = f"清理会话失败：{exc}"
+            self.state.error += f"\n{cleanup}"
+            print(cleanup, file=sys.stderr, flush=True)
 
     def _safe_close(self) -> None:
         try:
-            if self.state.phase in LIVE_PHASES:
+            if self.state.phase in (*LIVE_PHASES, Phase.ERROR):
                 self.backend.close_session()
             self.backend.close_preview()
         except Exception:  # noqa: BLE001

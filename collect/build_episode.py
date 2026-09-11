@@ -161,6 +161,8 @@ def main() -> int:
         row["gripper_width"] = rec["gripper_width"]
         row["gripper_command"] = rec["gripper_target"]
         row["gripper_master_ticks"] = rec["gripper_ticks"]
+        for key in ("gripper_position_raw", "gripper_requested_raw", "gripper_fault"):
+            row[key] = rec.get(key, "-1")
         row["deadman"] = rec["deadman"]
         row["state"] = rec["state"]
         out_rows.append(row)

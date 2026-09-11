@@ -1,4 +1,4 @@
-# robot-s0: grant liushuai access to its two D435i cameras and child nodes.
+# robot-s0: grant liushuai access to the registered D435i cameras and child nodes.
 # Match the D435i USB VID:PID used by librealsense v2.58.3's udev rules,
 # narrowed to this controller's camera serial numbers.
 # Named ACLs preserve existing ownership, groups and other users' access.
@@ -6,3 +6,4 @@
 # apply ACLs to current nodes directly, without retriggering/resetting cameras.
 SUBSYSTEMS=="usb", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b3a", ATTRS{serial}=="216623060304", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m u:liushuai:rw $env{DEVNAME}"
 SUBSYSTEMS=="usb", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b3a", ATTRS{serial}=="229123060429", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m u:liushuai:rw $env{DEVNAME}"
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b3a", ATTRS{serial}=="260243060185", ENV{DEVNAME}=="?*", RUN+="/usr/bin/setfacl -m u:liushuai:rw $env{DEVNAME}"

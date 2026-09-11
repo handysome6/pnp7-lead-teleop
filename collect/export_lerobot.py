@@ -81,6 +81,8 @@ def load_image(episode: Path, relative: str):
 
 def frame_state(row: dict[str, str]) -> np.ndarray:
     """Measured configuration: seven joints plus the measured gripper width."""
+    if float(row.get("gripper_position_raw") or -1) >= 0:
+        raise ValueError("Robotiq raw counts cannot be exported as metre-valued Franka Hand width; define a calibrated or explicitly normalized dataset schema first")
     width = float(row.get("gripper_width") or -1.0)
     return np.asarray(
         [float(row[f"q_robot{j}"]) for j in range(NJ)] + [max(width, 0.0)],
@@ -94,6 +96,8 @@ def frame_action(row: dict[str, str]) -> np.ndarray:
     roadmap is emphatic about: the training action is never the raw lead-arm
     encoder, because the master was not what the robot did.
     """
+    if float(row.get("gripper_requested_raw") or -1) >= 0:
+        raise ValueError("Robotiq raw commands cannot be exported as metre-valued Franka Hand targets")
     target = float(row.get("gripper_command") or -1.0)
     return np.asarray(
         [float(row[f"q_command{j}"]) for j in range(NJ)] + [max(target, 0.0)],

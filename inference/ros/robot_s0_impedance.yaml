@@ -1,0 +1,27 @@
+cartesian_impedance_controller:
+  type: serl_franka_controllers/CartesianImpedanceController
+  arm_id: fr3
+  joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+
+# Conservative validation parameters; robot collision reflexes are untouched.
+cartesian_impedance_controllerdynamic_reconfigure_compliance_param_node:
+  translational_stiffness: 1000.0
+  translational_damping: 63.0
+  rotational_stiffness: 80.0
+  rotational_damping: 7.0
+  nullspace_stiffness: 0.2
+  joint1_nullspace_stiffness: 1.0
+  translational_clip_neg_x: 0.005
+  translational_clip_neg_y: 0.005
+  translational_clip_neg_z: 0.005
+  translational_clip_x: 0.005
+  translational_clip_y: 0.005
+  translational_clip_z: 0.005
+  rotational_clip_neg_x: 0.03
+  rotational_clip_neg_y: 0.03
+  rotational_clip_neg_z: 0.03
+  rotational_clip_x: 0.03
+  rotational_clip_y: 0.03
+  rotational_clip_z: 0.03
+  translational_Ki: 0.0
+  rotational_Ki: 0.0

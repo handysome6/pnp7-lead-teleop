@@ -138,7 +138,9 @@
         <button class="big danger" id="btnDiscard" disabled>Discard <kbd>x</kbd></button>
       </div>
       <table style="margin-top:12px">
-        <tr><td>episodes kept</td><td id="epCount">0</td></tr>
+        <tr><td>已保存条数</td><td id="epCount">0</td></tr>
+        <tr><td>下一条编号</td><td id="epNext">—</td></tr>
+        <tr><td>未完成 / 失败条目</td><td id="epIncomplete">0</td></tr>
         <tr><td>F3 held</td><td id="epSteps">0.0 s</td></tr>
         <tr><td>F3 intervals</td><td id="epSegs">0</td></tr>
         <tr><td>released</td><td id="epSkipped">0.0 s</td></tr>
@@ -153,7 +155,7 @@
   </div>
 
   <div>
-    <div class="err" id="err"></div>
+    <div class="err" id="err" role="alert" style="white-space:pre-wrap;overflow-wrap:anywhere"></div>
 
     <section>
       <h2>Session</h2>
@@ -188,7 +190,7 @@
       <button class="wide" id="btnSaveHome" disabled>将当前位置保存为 Home</button>
       <div class="hint" id="homeTarget"></div>
       <div class="hint">机器人静止后读取实际关节角，写入所选配置。保存不触发回位；
-        录制或遥操作运行时不可保存。</div>
+        仅遥操会话中松开 F3 即可保存，完成后自动恢复会话；录制中不可保存。</div>
       <div class="hint" id="savedHome" style="overflow-wrap:anywhere"></div>
       <button class="wide" id="btnRestore" style="margin-top:10px" disabled>Restore start joints</button>
       <div class="hint">Refused while F3 is held or an episode is open — the move
@@ -197,7 +199,7 @@
       <table style="margin-top:10px">
         <tr><td>stream</td><td id="stream">—</td></tr>
         <tr><td>lead sample age</td><td id="align">—</td></tr>
-        <tr><td>gripper width</td><td id="grip">—</td></tr>
+        <tr><td>夹爪位置</td><td id="grip">—</td></tr>
         <tr><td>step rate</td><td id="hz">—</td></tr>
         <tr><td>uptime</td><td id="up">—</td></tr>
       </table>
@@ -229,6 +231,7 @@ let camsBuilt = null;   // not "": that equals the empty join, so the
                         // idle state would never draw its placeholders
 let isMock = false;
 let homeSaveBusy = false;
+let homeRestoreBusy = false;
 let configCatalog = [];
 
 function buildConfigOptions() {
@@ -239,23 +242,31 @@ function buildConfigOptions() {
   if (options.some(c => c.name === previous)) $("config").value = previous;
 }
 
-async function api(path, opts) {
-  const r = await fetch(path, opts);
-  let body = null;
-  try { body = await r.json(); } catch (_) { /* streams and 204s */ }
-  if (!r.ok) throw new Error((body && body.error) || `${r.status} ${r.statusText}`);
-  return body;
+async function api(path, opts = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts.method === "POST" ? 75000 : 5000);
+  try {
+    const r = await fetch(path, {...opts, signal: controller.signal, cache: "no-store"});
+    const body = await r.json();
+    if (!r.ok) throw new Error((body && body.error) || `${r.status} ${r.statusText}`);
+    return body;
+  } finally { clearTimeout(timer); }
 }
 
+const commandsInFlight = new Set();
 async function cmd(name, args = {}) {
+  if (commandsInFlight.has(name)) return;
+  commandsInFlight.add(name);
+  render(state);
   showErr("");
   try {
     await api("/api/command", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, args }),
+      body: JSON.stringify({ name, args, state_seen_at: state.server_time }),
     });
   } catch (e) { showErr(e.message); }
+  finally { commandsInFlight.delete(name); }
   refresh();
 }
 
@@ -265,20 +276,62 @@ function showErr(text) {
   el.classList.toggle("show", !!text);
 }
 
+// Each preview has at most one finite request. Removing a camera aborts its
+// request explicitly; no detached MJPEG image can retain a browser HTTP slot.
+let previewStops = [];
+function startPreview(img, name) {
+  let stopped = false, controller = null, timer = null, previousUrl = null;
+  async function tick() {
+    if (stopped) return;
+    controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    try {
+      const response = await fetch(`/preview/${encodeURIComponent(name)}`, {
+        signal: controller.signal, cache: "no-store",
+      });
+      if (!response.ok) throw new Error("preview unavailable");
+      const blob = await response.blob();
+      if (stopped) return;
+      const url = URL.createObjectURL(blob);
+      img.src = url;
+      if (previousUrl) URL.revokeObjectURL(previousUrl);
+      previousUrl = url;
+    } catch (_) { /* Keep the last frame and retry without delaying controls. */ }
+    finally {
+      clearTimeout(timeout);
+      if (!stopped) timer = setTimeout(tick, 200);
+    }
+  }
+  tick();
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+    if (controller) controller.abort();
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+    img.removeAttribute("src");
+  };
+}
+
 function buildCams(names, recording) {
   const key = names.join(",");
   if (key !== camsBuilt) {
+    previewStops.forEach(stop => stop());
+    previewStops = [];
     camsBuilt = key;
     $("cams").innerHTML = names.length
       ? names.map((n) => `
           <div class="cam" data-cam="${n}">
-            <img src="/stream/${encodeURIComponent(n)}?t=${Date.now()}" alt="${n}">
+            <img alt="${n}">
             <span class="tag">${n}</span>
           </div>`).join("")
       : `<div class="cam"><div class="placeholder">external<br><span style="opacity:.6">no stream — open a session</span></div></div>
          <div class="cam"><div class="placeholder">wrist<br><span style="opacity:.6">no stream — open a session</span></div></div>`;
   }
   document.querySelectorAll(".cam[data-cam]").forEach((el) => {
+    if (!el.dataset.previewStarted) {
+      el.dataset.previewStarted = "1";
+      previewStops.push(startPreview(el.querySelector("img"), el.dataset.cam));
+    }
     el.classList.toggle("rec", recording);
   });
 }
@@ -288,9 +341,10 @@ function render(s) {
   const live = s.phase === "ready" || s.phase === "recording";
   const rec = s.phase === "recording";
   const capturing = rec && s.deadman_held;
+  const homeBusy = homeSaveBusy || homeRestoreBusy || s.home_busy;
 
   $("phase").dataset.p = s.phase;
-  $("phaseText").textContent = capturing ? "capturing" : s.phase;
+  $("phaseText").textContent = s.phase === "error" ? "控制已停止：故障" : capturing ? "capturing" : s.phase;
   $("pedal").classList.toggle("held", !!s.deadman_held);
   $("pedalText").textContent = s.deadman_held ? "held" : "released";
   $("mode").textContent = s.config_name ? `${s.mode} · ${s.config_name}` : "";
@@ -301,11 +355,12 @@ function render(s) {
 
   $("btnOpen").disabled = s.phase !== "idle";
   $("btnTeleop").disabled = s.phase !== "idle";
-  $("btnClose").disabled = !live;
-  $("btnRestore").disabled = s.phase !== "ready" || s.deadman_held;
+  $("btnClose").disabled = !live && s.phase !== "error";
+  $("btnRestore").disabled = homeBusy || s.phase !== "ready" || s.deadman_held || s.stream_enabled;
+  $("btnRestore").textContent = homeRestoreBusy ? "正在恢复起始关节位置…" : "Restore start joints";
   const homeConfig = s.phase === "ready" ? s.config_name : $("config").value;
-  const homeAllowed = s.phase === "idle" || (s.phase === "ready" && s.mode === "collect");
-  $("btnSaveHome").disabled = homeSaveBusy || isMock || !homeConfig || !homeAllowed;
+  const homeAllowed = s.phase === "idle" || (s.phase === "ready" && !s.deadman_held && !s.stream_enabled);
+  $("btnSaveHome").disabled = homeBusy || isMock || !homeConfig || !homeAllowed;
   $("btnSaveHome").textContent = homeSaveBusy ? "正在读取并保存…" : "将当前位置保存为 Home";
   $("homeTarget").textContent = isMock ? "模拟模式不写入真实配置"
     : homeConfig ? `保存到 conf/${homeConfig}.conf` : "请先选择配置";
@@ -322,22 +377,30 @@ function render(s) {
   const saved = s.saved_home;
   $("savedHome").textContent = saved && saved.config_name === homeConfig
     ? `已保存 J1–J7（rad）：${saved.q.map(q => q.toFixed(6)).join(" ")}` : "";
-  if (homeSaveBusy) {
+  if (homeBusy) {
     $("btnOpen").disabled = true;
     $("btnTeleop").disabled = true;
     $("btnClose").disabled = true;
     $("btnRestore").disabled = true;
   }
-  $("btnStart").disabled = homeSaveBusy || s.phase !== "ready" || s.mode === "teleop";
+  $("btnStart").disabled = homeBusy || s.phase !== "ready" || s.mode === "teleop";
   $("btnStop").disabled = !rec;
   $("btnDiscard").disabled = !rec;
   $("btnFinalize").disabled = !live || s.mode === "teleop";
+  for (const [id, command] of Object.entries({btnOpen: "open_session", btnTeleop: "open_session",
+      btnStart: "begin_episode", btnStop: "end_episode", btnDiscard: "discard_episode",
+      btnClose: "close_session", btnRestore: "restore_joints", btnSaveHome: "save_home",
+      btnFinalize: "finalize_dataset"})) {
+    if (commandsInFlight.has(command)) $(id).disabled = true;
+  }
 
   // The backend samples the bridge at 10 Hz, so these counts are tenths of a
   // second of pedal rather than frames.
   const held = (s.episode_steps ?? 0) / 10;
   const released = (s.skipped_steps ?? 0) / 10;
   $("epCount").textContent = s.episode_index;
+  $("epNext").textContent = s.next_episode || "—";
+  $("epIncomplete").textContent = s.incomplete_episodes || 0;
   $("epSteps").textContent = held.toFixed(1) + " s";
   $("epSegs").textContent = s.episode_segments ?? 0;
   $("epSkipped").textContent = released.toFixed(1) + " s";
@@ -348,7 +411,9 @@ function render(s) {
 
   $("stream").textContent = s.stream_enabled ? "enabled" : (s.block_reason || "—");
   $("align").textContent = s.lead_age_ms == null ? "—" : s.lead_age_ms.toFixed(1) + " ms";
-  $("grip").textContent = s.gripper_width == null ? "—" : s.gripper_width.toFixed(4) + " m";
+  $("grip").textContent = s.gripper_position_raw != null
+    ? `Robotiq ${s.gripper_position_raw}/255（0=开，255=闭）→ ${s.gripper_requested_raw ?? "—"}`
+    : s.gripper_width == null ? "—" : s.gripper_width.toFixed(4) + " m";
   $("hz").textContent = live ? s.step_hz.toFixed(1) + " Hz" : "—";
   $("up").textContent = live ? s.uptime_s.toFixed(0) + " s" : "—";
   $("dsdir").textContent = s.dataset_dir || "—";
@@ -359,9 +424,16 @@ function render(s) {
     : "";
 }
 
+let refreshPending = false;
 async function refresh() {
+  if (refreshPending) return;
+  refreshPending = true;
   try { render(await api("/api/state")); }
-  catch (e) { showErr("lost the control loop: " + e.message); }
+  catch (e) {
+    showErr("网页状态连接超时或中断，正在重连：" + e.message);
+    ["btnOpen", "btnTeleop", "btnStart", "btnRestore", "btnSaveHome"].forEach(
+      id => $(id).disabled = true);
+  } finally { refreshPending = false; }
 }
 
 function overrides() {
@@ -383,7 +455,13 @@ const open = (mode) => cmd("open_session", {
 $("btnOpen").onclick     = () => open("collect");
 $("btnTeleop").onclick   = () => open("teleop");
 $("btnClose").onclick    = () => cmd("close_session");
-$("btnRestore").onclick  = () => cmd("restore_joints");
+$("btnRestore").onclick = async () => {
+  if ($("btnRestore").disabled) return;
+  homeRestoreBusy = true;
+  render(state);
+  try { await cmd("restore_joints"); }
+  finally { homeRestoreBusy = false; await refresh(); }
+};
 $("btnSaveHome").onclick = async () => {
   if (homeSaveBusy || $("btnSaveHome").disabled) return;
   const config_name = state.phase === "ready" ? state.config_name : $("config").value;
@@ -425,6 +503,8 @@ document.addEventListener("keydown", (e) => {
 document.addEventListener("keyup", (e) => {
   if (e.code === "Space") { e.preventDefault(); setPedal(false); }
 });
+
+window.addEventListener("pagehide", () => previewStops.forEach(stop => stop()));
 
 (async function init() {
   try {

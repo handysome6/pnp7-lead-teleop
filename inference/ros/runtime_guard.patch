@@ -1,0 +1,126 @@
+--- a/franka_ros/franka_hw/src/franka_hw.cpp
++++ b/franka_ros/franka_hw/src/franka_hw.cpp
+@@ -180,6 +180,8 @@
+   std::lock_guard<std::mutex> lock(robot_mutex_);
+   if (!robot_) {
+     robot_ = std::make_unique<franka::Robot>(robot_ip_, realtime_config_);
++    // Policy validation must preserve the robot's commissioned reflex settings.
++    if (!ros::NodeHandle("~").param("preserve_collision_behavior", false)) {
+     robot_->setCollisionBehavior(collision_config_.lower_torque_thresholds_acceleration,
+                                  collision_config_.upper_torque_thresholds_acceleration,
+                                  collision_config_.lower_torque_thresholds_nominal,
+@@ -188,6 +190,7 @@
+                                  collision_config_.upper_force_thresholds_acceleration,
+                                  collision_config_.lower_force_thresholds_nominal,
+                                  collision_config_.upper_force_thresholds_nominal);
++    }
+   }
+ }
+ 
+--- a/serl_franka_controllers/src/cartesian_impedance_controller.cpp
++++ b/serl_franka_controllers/src/cartesian_impedance_controller.cpp
+@@ -4,6 +4,7 @@
+ */
+ 
+ #include <serl_franka_controllers/cartesian_impedance_controller.h>
++#include <serl_franka_controllers/policy_watchdog.h>
+ 
+ #include <cmath>
+ #include <memory>
+@@ -106,6 +107,12 @@
+ 
+   cartesian_stiffness_.setZero();
+   cartesian_damping_.setZero();
++  Ki_.setZero();
++  error_.setZero();
++  error_i.setZero();
++  node_handle.setParam("policy_watchdog_available", true);
++  node_handle.setParam("policy_tracking_position_limit", pnp7_policy::kTrackingPositionLimit);
++  node_handle.setParam("policy_tracking_rotation_limit", pnp7_policy::kTrackingRotationLimit);
+ 
+   return true;
+ }
+@@ -129,6 +134,8 @@
+ 
+   // set nullspace equilibrium configuration to initial q
+   q_d_nullspace_ = q_initial;
++  error_i.setZero();
++  controller_started_ns_ = steadyNowNs();
+ }
+ 
+ void CartesianImpedanceController::update(const ros::Time& time,
+@@ -148,6 +155,22 @@
+   Eigen::Affine3d transform(Eigen::Matrix4d::Map(robot_state.O_T_EE.data()));
+   Eigen::Vector3d position(transform.translation());
+   Eigen::Quaterniond orientation(transform.linear());
++
++  // Preserve SERL's control law; only accept fresh targets through an RT buffer.
++  // An expired input removes the pose error rather than continuing toward the
++  // last attractor. No socket, serial I/O or blocking lock runs in this callback.
++  const auto target = *policy_target_.readFromRT();
++  const bool fresh = pnp7_policy::fresh(target.received_ns, controller_started_ns_, steadyNowNs());
++  const bool close = pnp7_policy::close(target.position, target.orientation, position, orientation);
++  if (fresh && close) {
++    position_d_target_ = target.position;
++    orientation_d_target_ = target.orientation;
++  } else {
++    position_d_ = position_d_target_ = position;
++    orientation_d_ = orientation_d_target_ = orientation;
++  }
++  // This deployment uses no integral gain. Reset only on the RT thread.
++  error_i.setZero();
+ 
+   // compute error to desired pose
+   // Clip translational error
+@@ -274,14 +297,15 @@
+ 
+ void CartesianImpedanceController::equilibriumPoseCallback(
+     const geometry_msgs::PoseStampedConstPtr& msg) {
+-  position_d_target_ << msg->pose.position.x, msg->pose.position.y, msg->pose.position.z;
+-  error_i.setZero();
+-  Eigen::Quaterniond last_orientation_d_target(orientation_d_target_);
+-  orientation_d_target_.coeffs() << msg->pose.orientation.x, msg->pose.orientation.y,
++  PolicyTarget target;
++  target.position << msg->pose.position.x, msg->pose.position.y, msg->pose.position.z;
++  target.orientation.coeffs() << msg->pose.orientation.x, msg->pose.orientation.y,
+       msg->pose.orientation.z, msg->pose.orientation.w;
+-  if (last_orientation_d_target.coeffs().dot(orientation_d_target_.coeffs()) < 0.0) {
+-    orientation_d_target_.coeffs() << -orientation_d_target_.coeffs();
+-  }
++  const auto message_age = (ros::Time::now() - msg->header.stamp).toSec();
++  if (!pnp7_policy::valid(target.position, target.orientation, message_age, msg->header.frame_id)) return;
++  target.orientation.normalize();
++  target.received_ns = steadyNowNs();
++  policy_target_.writeFromNonRT(target);
+ }
+ 
+ }  // namespace serl_franka_controllers
+--- a/serl_franka_controllers/include/serl_franka_controllers/cartesian_impedance_controller.h
++++ b/serl_franka_controllers/include/serl_franka_controllers/cartesian_impedance_controller.h
+@@ -20,6 +20,8 @@
+ #include <franka_hw/franka_model_interface.h>
+ #include <franka_hw/franka_state_interface.h>
+ #include <realtime_tools/realtime_publisher.h>
++#include <realtime_tools/realtime_buffer.h>
++#include <chrono>
+ #include <serl_franka_controllers/ZeroJacobian.h>
+ 
+ namespace serl_franka_controllers {
+@@ -34,6 +36,17 @@
+   void update(const ros::Time&, const ros::Duration& period) override;
+ 
+  private:
++  struct PolicyTarget {
++    Eigen::Vector3d position = Eigen::Vector3d::Zero();
++    Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
++    int64_t received_ns = 0;
++  };
++  static int64_t steadyNowNs() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++  }
++  realtime_tools::RealtimeBuffer<PolicyTarget> policy_target_;
++  int64_t controller_started_ns_ = 0;
+   // Saturation
+   Eigen::Matrix<double, 7, 1> saturateTorqueRate(
+       const Eigen::Matrix<double, 7, 1>& tau_d_calculated,

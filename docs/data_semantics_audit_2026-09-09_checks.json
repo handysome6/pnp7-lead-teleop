@@ -1,0 +1,67 @@
+{
+  "data_source": "synthetic only",
+  "checks": {
+    "paused_but_pedal_held": {
+      "retained_rows": 1,
+      "builder_exit": 0
+    },
+    "delta_across_one_second_gap": {
+      "gap_ms": 1000.0,
+      "dq_action0": 0.011,
+      "last_row_delta": 0.001
+    },
+    "ee_transition_across_gap": {
+      "dx_m": 0.05000000074505806,
+      "source_interval_s": 1.0,
+      "state_gripper_at_closed_command_with_open_measurement": 0.0
+    },
+    "stationary_pose_across_gap": {
+      "source_interval_s": 1.0,
+      "action_pose_delta": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -0.0,
+        0.0
+      ],
+      "transition_still_emitted": true
+    },
+    "gripper_copy_baseline_synthetic": {
+      "frames": 584,
+      "switches": 2,
+      "overall_accuracy": 0.9965753424657534,
+      "overall_l1": 0.0034246575087308884,
+      "switch_frame_accuracy": 0.0,
+      "scope": "one-step synthetic baseline, not actual checkpoint inference"
+    },
+    "ee_export_ignores_joint_commands_and_gripper_feedback": {
+      "states_unchanged": true,
+      "actions_unchanged": true
+    },
+    "joint_export_missing_gripper": {
+      "input": -1,
+      "output_state": 0.0,
+      "output_action": 0.0
+    },
+    "short_pause_segment_detection": {
+      "gap_ms": 150,
+      "segments": 1
+    },
+    "validator_nan": {
+      "returncode": 0,
+      "stdout": "frames        : 180 rows x 2 cameras, 0 missing, 0 empty\n  rgb_external     180 unique, 0 reused\n  rgb_wrist        180 unique, 0 reused\nJ1 command span 0.0179 rad, measured 0.0179\nJ2 command span 0.0179 rad, measured 0.0179\nJ3 command span 0.0179 rad, measured 0.0179\nJ4 command span 0.0179 rad, measured 0.0179\nJ5 command span 0.0179 rad, measured 0.0179\nJ6 command span 0.0179 rad, measured 0.0179\nJ7 command span 0.0179 rad, measured 0.0179\njoints active : 7 of 7\ngripper       : 20.0..37.9 mm (span 17.9 mm)\nsegments      : 1 contiguous (longest 180, shortest 180)\nmax |dq_action|: 0.0110 rad\nrobot skew    : mean 0.0 ms, max 0.0 ms\n\nepisode looks good\n\nverdict: PASS\n",
+      "stderr": ""
+    },
+    "validator_undecodable_images": {
+      "returncode": 0,
+      "stdout": "frames        : 180 rows x 2 cameras, 0 missing, 0 empty\n  rgb_external     180 unique, 0 reused\n  rgb_wrist        180 unique, 0 reused\nJ1 command span 0.0179 rad, measured 0.0179\nJ2 command span 0.0179 rad, measured 0.0179\nJ3 command span 0.0179 rad, measured 0.0179\nJ4 command span 0.0179 rad, measured 0.0179\nJ5 command span 0.0179 rad, measured 0.0179\nJ6 command span 0.0179 rad, measured 0.0179\nJ7 command span 0.0179 rad, measured 0.0179\njoints active : 7 of 7\ngripper       : 20.0..37.9 mm (span 17.9 mm)\nsegments      : 1 contiguous (longest 180, shortest 180)\nmax |dq_action|: 0.0110 rad\nrobot skew    : mean 0.0 ms, max 0.0 ms\n\nepisode looks good\n\nverdict: PASS\n",
+      "stderr": ""
+    },
+    "validator_bad_camera_skew": {
+      "returncode": 0,
+      "stdout": "frames        : 180 rows x 2 cameras, 0 missing, 0 empty\n  rgb_external     180 unique, 0 reused\n  rgb_wrist        180 unique, 0 reused\nJ1 command span 0.0179 rad, measured 0.0179\nJ2 command span 0.0179 rad, measured 0.0179\nJ3 command span 0.0179 rad, measured 0.0179\nJ4 command span 0.0179 rad, measured 0.0179\nJ5 command span 0.0179 rad, measured 0.0179\nJ6 command span 0.0179 rad, measured 0.0179\nJ7 command span 0.0179 rad, measured 0.0179\njoints active : 7 of 7\ngripper       : 20.0..37.9 mm (span 17.9 mm)\nsegments      : 1 contiguous (longest 180, shortest 180)\nmax |dq_action|: 0.0110 rad\nrobot skew    : mean 0 ms, max 0 ms\n\nepisode looks good\n\nverdict: PASS\n",
+      "stderr": ""
+    }
+  }
+}

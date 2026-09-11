@@ -107,6 +107,8 @@ class GuiHandler(http.server.BaseHTTPRequestHandler):
                 "configs": self.server.loop.backend.list_configs(),
                 "mock": self.server.mock_backend is not None,
             })
+        elif path.startswith("/preview/"):
+            self._serve_preview(path[len("/preview/"):])
         elif path.startswith("/stream/"):
             self._serve_mjpeg(path[len("/stream/"):])
         else:
@@ -145,7 +147,16 @@ class GuiHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": "missing command name"}, 400)
             return
         args = payload.get("args") or {}
-        cmd = self.server.loop.submit(name, **args)
+        expires_at = None
+        if name in ('begin_episode', 'open_session', 'restore_joints', 'save_home'):
+            seen = payload.get('state_seen_at')
+            if seen is not None:
+                if type(seen) not in (int, float) or not 0 <= time.time() - seen <= 5:
+                    self._send_json({'accepted': False, 'error':
+                                     '操作请求已过期，请确认最新页面状态后重新点击'}, 409)
+                    return
+                expires_at = seen + 5
+        cmd = self.server.loop.submit(name, _expires_at=expires_at, **args)
         # Opening a session builds the env and runs an alignment check; restoring
         # the arm is a real move. Both take seconds, so wait generously and let
         # the UI fall back to polling if it still has not landed.
@@ -167,6 +178,28 @@ class GuiHandler(http.server.BaseHTTPRequestHandler):
         ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         self._send_bytes(target.read_bytes(), ctype)
 
+    def _serve_preview(self, camera: str) -> None:
+        """One finite JPEG response, so previews cannot monopolize HTTP slots."""
+        backend = self.server.loop.backend
+        if camera not in getattr(backend, "camera_names", []):
+            self._send_json({"error": "camera unavailable"}, 404)
+            return
+        chunk = backend.latest_jpeg(camera)
+        if chunk is None:
+            frame = backend.latest_frame(camera)
+            if frame is not None:
+                ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                chunk = buf.tobytes() if ok else None
+        if not chunk:
+            self._send_json({"error": "waiting for camera frame"}, 503)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(chunk)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(chunk)
+
     def _serve_mjpeg(self, camera: str) -> None:
         backend = self.server.loop.backend
         if camera not in getattr(backend, "camera_names", []):
@@ -179,7 +212,8 @@ class GuiHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
-        period = 1.0 / 15.0  # preview only; the recorded rate is the env's
+        period = 1.0 / 5.0  # Limit website bandwidth; recording stays at 30 fps.
+        last_chunk = None
         try:
             while True:
                 t0 = time.perf_counter()
@@ -192,13 +226,14 @@ class GuiHandler(http.server.BaseHTTPRequestHandler):
                         ok, buf = cv2.imencode(
                             ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
                         chunk = buf.tobytes() if ok else None
-                if chunk:
+                if chunk and chunk != last_chunk:
                     self.wfile.write(f"--{BOUNDARY}\r\n".encode())
                     self.wfile.write(b"Content-Type: image/jpeg\r\n")
                     self.wfile.write(
                         f"Content-Length: {len(chunk)}\r\n\r\n".encode())
                     self.wfile.write(chunk)
                     self.wfile.write(b"\r\n")
+                    last_chunk = chunk
                 elapsed = time.perf_counter() - t0
                 if elapsed < period:
                     time.sleep(period - elapsed)

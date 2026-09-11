@@ -29,6 +29,8 @@ settings long after the robot has been switched off.
 from __future__ import annotations
 
 import json
+import re
+from contextlib import contextmanager
 import shutil
 import signal
 import subprocess
@@ -40,8 +42,9 @@ from typing import Any
 import cv2
 import numpy as np
 
-from gui.session import Backend, Mode, Rejected
+from gui.session import Backend, EpisodeReflex, Mode, Rejected
 from gui.home_config import save_current_home
+from gui.episode_catalog import progress, reserve
 
 REPO = Path(__file__).resolve().parent.parent
 # Recorder and post-processing must use the environment running the GUI.
@@ -206,6 +209,7 @@ class LegacyBackend(Backend):
         if overrides.get("episodes_dir"):
             self.episodes_dir = Path(overrides["episodes_dir"])
         self.episodes_dir.mkdir(parents=True, exist_ok=True)
+        self.dataset_progress()  # Validate prefix and persisted sequence before hardware access.
 
         self.open_preview()
 
@@ -224,6 +228,16 @@ class LegacyBackend(Backend):
         self._config_path = None
         self._episode_dir = None
 
+    def abort_session(self, reason: str) -> None:
+        """Keep a failed take's raw files and error log for diagnosis."""
+        try:
+            if self._episode_dir is not None:
+                (self._episode_dir / "failure.json").write_text(json.dumps(
+                    {"error": reason, "time": time.time(), "usable_episode": False},
+                    ensure_ascii=False, indent=2) + "\n")
+        finally:
+            self.close_session()
+
     # --- per-step ---------------------------------------------------------
     def step(self, recording: bool) -> dict[str, Any]:
         """Poll the bridge's status file and the children's health.
@@ -233,7 +247,15 @@ class LegacyBackend(Backend):
         publisher's rate.
         """
         telemetry: dict[str, Any] = {"cameras": list(self.camera_names)}
+        # A fresh status file can survive a crash. Check the process before
+        # trusting it, and never classify a nonzero exit as a duration limit.
+        bridge_exit = self._bridge.proc.poll() if self._bridge is not None else None
+        failure = self._bridge_failure(self._bridge, recording=recording)
+        if failure is not None:
+            raise failure
         status = self._read_status()
+        if bridge_exit is not None:
+            status = None
 
         if status is not None:
             self._last_status = status
@@ -241,10 +263,15 @@ class LegacyBackend(Backend):
             telemetry.update(
                 deadman_held=held,
                 stream_enabled=held and status.get("state") == 1,
-                block_reason=None if held else "deadman_released",
+                block_reason=(None if held and status.get("state") == 1 else
+                              "控制已暂停：等待 GELLO 新数据或会话结束" if held else
+                              "脚刹已松开，或启动后尚未先松开脚刹"),
                 joints=list(status.get("q") or []),
                 lead_age_ms=self._nonnegative(status.get("lead_age_ms")),
                 gripper_width=self._nonnegative(status.get("gripper_width")),
+                gripper_position_raw=self._nonnegative(status.get("gripper_position_raw")),
+                gripper_requested_raw=self._nonnegative(status.get("gripper_requested_raw")),
+                gripper_fault=self._nonnegative(status.get("gripper_fault")),
             )
             if recording:
                 self._total_samples += 1
@@ -260,11 +287,12 @@ class LegacyBackend(Backend):
                 # given. That is a take running to its natural end, not a
                 # fault, so ask the control loop to close the episode rather
                 # than raising -- raising would discard a perfectly good take.
-                telemetry["block_reason"] = "duration reached"
+                telemetry["block_reason"] = "控制程序正常结束（到时或收到停止信号）"
+                telemetry["message"] = "控制程序已结束；继续操作前请关闭并重新打开会话"
                 if recording:
                     telemetry["episode_finished"] = True
             elif self._bridge is not None:
-                telemetry["block_reason"] = "waiting for bridge status"
+                telemetry["block_reason"] = "控制程序仍在运行，但状态更新缺失或已超过 1 秒"
             else:
                 telemetry["block_reason"] = "bridge not running"
 
@@ -284,9 +312,42 @@ class LegacyBackend(Backend):
         return telemetry
 
     # --- operator actions -------------------------------------------------
+    @contextmanager
+    def _home_operation(self):
+        """Yield the FCI to Home, keeping the teleop session/cameras open.
+
+        Resume after success or an operator refusal, never after a fault. The
+        new bridge captures a new clutch origin and requires release if F3
+        was pressed during the handover.
+        """
+        if self._config_path is not None and self._dry_run:
+            raise Rejected("dry run 会话不能读取或恢复实际机器人 Home")
+        resume = self._mode is Mode.TELEOP and self._config_path is not None
+        bridge = self._bridge
+        if resume:
+            if bridge is None or not bridge.alive:
+                raise RuntimeError("遥操控制程序已停止，请关闭会话后重新打开")
+            status = self._read_status()
+            if (status is None or status.get("deadman") != 0
+                    or status.get("state") not in (0, 2)):
+                raise Rejected("请松开 F3，并等待遥操暂停状态更新后再操作 Home")
+            self._stop_bridge()
+            if bridge.proc.poll() != 0:
+                raise RuntimeError("暂停遥操失败，未执行 Home 操作：\n" +
+                                   self._tail(bridge.log_path, lines=12))
+        elif bridge is not None and bridge.alive:
+            raise Rejected("请先结束录制，再操作 Home")
+        try:
+            yield
+        except Rejected:
+            if resume:
+                self._start_bridge(log_csv=None)
+            raise
+        else:
+            if resume:
+                self._start_bridge(log_csv=None)
+
     def save_home(self, config_name: str) -> dict[str, Any]:
-        if self._bridge is not None and self._bridge.alive:
-            raise Rejected("请先停止遥操作，再保存 Home")
         if self._config_path is not None and self._dry_run:
             raise Rejected("请先关闭 dry run 会话，再读取实际机器人姿态")
         if not isinstance(config_name, str) or not config_name or Path(config_name).name != config_name:
@@ -318,27 +379,29 @@ class LegacyBackend(Backend):
             except json.JSONDecodeError as exc:
                 raise Rejected("机器人姿态数据格式错误，配置未修改") from exc
 
-        return save_current_home(config, read_q)
+        with self._home_operation():
+            return save_current_home(config, read_q)
 
     def restore_joints(self, qpos: list[float] | None = None) -> None:
-        """Item 1: `pnp7_teleop home`, which owns the FCI for the move.
-
-        Refused while the bridge is up, because two processes cannot both hold
-        the FCI connection -- and the second one to try gets a libfranka
-        network exception rather than anything self-explanatory.
-        """
-        if self._bridge is not None and self._bridge.alive:
-            raise Rejected("stop the take before restoring the arm")
+        """Temporarily yield the FCI and restore the selected config's Home."""
         if self._config_path is None:
             raise Rejected("no session is open")
+        with self._home_operation():
+            self._restore_home()
+
+    def _restore_home(self) -> None:
         result = subprocess.run(
             [str(self.bridge), "home", str(self._config_path)],
             cwd=str(REPO), capture_output=True, text=True, timeout=120,
         )
         if result.returncode != 0:
-            raise RuntimeError(
-                (result.stderr or result.stdout or "home failed").strip()
-                .splitlines()[-1])
+            detail = "\n".join((result.stderr or result.stdout or "home failed")
+                               .strip().splitlines()[-12:])
+            # The pedal can change after the GUI's last poll. The bridge's
+            # preflight refusal is still an operator guard, not a runtime fault.
+            if "home refused:" in detail:
+                raise Rejected(detail)
+            raise RuntimeError(detail)
 
     def begin_episode(self) -> None:
         """Cameras first, then the bridge -- the order collect_episode.sh set.
@@ -349,8 +412,7 @@ class LegacyBackend(Backend):
         if self._config_path is None:
             raise Rejected("no session is open")
 
-        episode = self._next_episode_dir()
-        episode.mkdir(parents=True, exist_ok=True)
+        episode = reserve(self.episodes_dir, self._prefix)
         self._episode_dir = episode
         self._held_samples = 0
         self._total_samples = 0
@@ -381,25 +443,28 @@ class LegacyBackend(Backend):
             self._start_bridge(log_csv=episode / "teleop.csv",
                                config=episode / "config.conf")
         except Exception:
-            # Never leave a half-started take holding the cameras.
+            # Release hardware, but retain logs and the directory for
+            # abort_session() to mark as a failed take.
             self._stop_bridge()
             self._stop_recorder()
-            shutil.rmtree(episode, ignore_errors=True)
-            self._episode_dir = None
             raise
         self._episode_started = time.monotonic()
 
     def end_episode(self, keep: bool) -> dict[str, Any]:
         episode = self._episode_dir
-        self._episode_dir = None
+        bridge = self._bridge
         self._stop_bridge()
         self._stop_recorder()
-
+        if keep:
+            failure = self._bridge_failure(bridge, recording=True)
+            if failure is not None:
+                raise failure
         if episode is None:
             return {"kept": False, "reason": "no episode was open"}
 
         if not keep:
             shutil.rmtree(episode, ignore_errors=True)
+            self._episode_dir = None
             self.open_preview()
             return {"kept": False, "reason": "discarded"}
 
@@ -408,12 +473,17 @@ class LegacyBackend(Backend):
             # The same floor collect_episode.sh enforces: below this the bridge
             # barely ran, usually a refused preflight.
             shutil.rmtree(episode, ignore_errors=True)
+            self._episode_dir = None
             self.open_preview()
             return {"kept": False,
                     "reason": f"bridge wrote only {rows} rows; take discarded"}
 
         report = self._build_and_validate(episode)
         self._last_report = report
+        if not (episode / 'episode.csv').is_file() or report.get('frames', 0) <= 0:
+            raise RuntimeError('本条原始数据已保留，但汇总生成失败，未计入已保存条数：' +
+                               str(report.get('build_output', report.get('problems'))))
+        self._episode_dir = None
         self.open_preview()
         return {
             "kept": True,
@@ -466,6 +536,14 @@ class LegacyBackend(Backend):
             if not p.is_file() or p.is_symlink():
                 continue
             category, label, order = presets.get(p.stem, ("debug", p.stem, 99))
+            fields = dict(line.split("=", 1) for line in
+                          (line.split("#", 1)[0].strip() for line in p.read_text().splitlines())
+                          if "=" in line)
+            fields = {k.strip(): v.strip() for k, v in fields.items()}
+            if fields.get("gripper_type") == "robotiq":
+                label = label.replace("二值夹爪", "Robotiq 夹爪")
+            if fields.get("gripper_enabled", "0") == "0":
+                label = label.replace("二值夹爪", "夹爪关闭").replace("Robotiq 夹爪", "夹爪关闭")
             configs.append({"name": p.stem, "path": str(p), "label": label,
                             "category": category, "order": order})
         return sorted(configs, key=lambda c: (c["order"], c["name"]))
@@ -491,14 +569,15 @@ class LegacyBackend(Backend):
         if log_csv is not None:
             argv.append(str(log_csv))
         log_path = ((log_csv.parent / "bridge.log") if log_csv
-                    else self.scratch_dir / "pnp7_bridge.log")
+                    else self.scratch_dir / f"pnp7_bridge_{time.time_ns()}.log")
         self._bridge = _Proc("bridge", argv, log_path=log_path)
 
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
             if not self._bridge.alive:
                 raise RuntimeError(
-                    "bridge exited during startup: " + self._tail(log_path))
+                    f"控制程序启动失败（退出码 {self._bridge.proc.returncode}）\n"
+                    f"日志：{log_path}\n" + self._tail(log_path, lines=12))
             if self.status_path.is_file():
                 return
             time.sleep(0.1)
@@ -596,16 +675,22 @@ class LegacyBackend(Backend):
 
     # --- internals: post-processing --------------------------------------
     def _build_and_validate(self, episode: Path) -> dict[str, Any]:
+        roles = sorted(p.name[len('cam_'):-len('_index.csv')]
+                       for p in episode.glob('cam_*_index.csv'))
+        # Preserve actual camera role names. Prefer the named external view,
+        # otherwise the non-wrist camera when the USB serial changed.
+        anchor = 'external' if 'external' in roles else next(
+            (role for role in roles if role != 'wrist'), roles[0] if roles else 'external')
         build = subprocess.run(
             [str(self.python), str(REPO / "collect" / "build_episode.py"),
-             "--episode", str(episode), "--no-events"],
+             "--episode", str(episode), "--no-events", "--anchor", anchor],
             cwd=str(REPO), capture_output=True, text=True, timeout=600,
         )
         # Exit 1 here means a stream exceeded the skew tolerance -- episode.csv
         # is still written. That is a warning about alignment, not a failure.
         report: dict[str, Any] = {
             "build_ok": build.returncode == 0,
-            "build_output": (build.stdout or "").strip().splitlines()[-6:],
+            "build_output": ((build.stdout or "") + "\n" + (build.stderr or "")).strip().splitlines()[-10:],
         }
         if not (episode / "episode.csv").is_file():
             report["verdict"] = "FAIL"
@@ -647,11 +732,81 @@ class LegacyBackend(Backend):
         return {"verdict": verdict, "problems": problems}
 
     # --- small helpers ----------------------------------------------------
+    @staticmethod
+    def _collision_reflex_only(detail: str) -> bool:
+        """Classify the SDK error list, not the generic 'reflex' wording.
+
+        Communication and discontinuity failures also say 'reflex'. A mixed
+        list must keep the full fault behavior, even if it includes collision.
+        """
+        matches = re.findall(r'motion aborted by reflex!\s*(\[[^\]]*\])', detail)
+        matches += re.findall(r'Franka fault onset:[^\n]*?errors=(\[[^\]]*\])', detail)
+        if 'franka error: libfranka: Move command aborted: motion aborted by reflex!' not in detail:
+            return False
+        if not matches:
+            return False
+        for raw in matches:
+            try:
+                errors = json.loads(raw)
+                if not errors or not set(errors) <= {'cartesian_reflex', 'joint_reflex'}:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    def _bridge_failure(self, bridge: _Proc | None, *, recording: bool) -> Exception | None:
+        code = bridge.proc.poll() if bridge is not None else None
+        if code is None or code == 0:
+            return None
+        log = bridge.log_path
+        detail = self._tail(log, lines=20)
+        collision = code == 1 and self._collision_reflex_only(detail)
+        if collision:
+            reason = "Franka 触发碰撞保护，本条数据无效"
+        elif "FCI timing guard:" in detail:
+            reason = "FCI 控制回调超时，已取消过期关节指令并停止"
+        elif "discontinuity" in detail:
+            reason = "Franka 检测到关节指令不连续，已中止运动"
+        elif "communication_constraints_violation" in detail:
+            reason = "Franka 通信时序不满足要求，已中止运动"
+        else:
+            reason = "控制程序异常退出"
+        exception = (EpisodeReflex if collision and recording and
+                     self._mode is Mode.COLLECT and self._episode_dir is not None
+                     else RuntimeError)
+        return exception(f"{reason}（退出码 {code}）\n日志：{log}\n{detail}")
+
+    def discard_reflex_episode(self, reason: str) -> dict[str, Any]:
+        episode = self._episode_dir
+        if episode is None or self._mode is not Mode.COLLECT:
+            raise RuntimeError("没有可丢弃的采集条目")
+        self._stop_bridge()
+        self._stop_recorder()
+        diagnostic = self.scratch_dir / f"pnp7_discarded_{episode.name}_{time.time_ns()}"
+        diagnostic.mkdir(parents=True)
+        for name in ('bridge.log', 'cameras.log', 'config.conf'):
+            source = episode / name
+            if source.is_file():
+                shutil.copy2(source, diagnostic / name)
+        (diagnostic / 'failure.json').write_text(json.dumps({
+            'error': reason, 'episode': episode.name, 'time': time.time(),
+            'usable_episode': False, 'discarded': True,
+        }, ensure_ascii=False, indent=2) + '\n')
+        # Fail visibly if removal fails; never report invalid data discarded
+        # while it is still sitting among the dataset's episodes.
+        shutil.rmtree(episode)
+        self._episode_dir = None
+        self._held_samples = self._total_samples = self._segments = 0
+        self._was_held = False
+        self._last_status = {}
+        self.open_preview()
+        return {'episode': episode.name, 'diagnostic_dir': str(diagnostic)}
+
+    def dataset_progress(self) -> dict[str, Any]:
+        return progress(self.episodes_dir, self._prefix)
+
     def _next_episode_dir(self) -> Path:
-        index = 1
-        while (self.episodes_dir / f"{self._prefix}{index:03d}").exists():
-            index += 1
-        return self.episodes_dir / f"{self._prefix}{index:03d}"
+        return self.episodes_dir / self.dataset_progress()['next_episode']
 
     @staticmethod
     def _teleop_rows(path: Path) -> int:

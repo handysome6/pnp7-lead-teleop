@@ -1,0 +1,53 @@
+[workspace]
+name = "pnp7-policy-ros"
+version = "0.1.0"
+channels = ["https://prefix.dev/robostack-noetic", "conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+ros-noetic-ros-base = "*"
+ros-noetic-controller-manager = "*"
+ros-noetic-combined-robot-hw = "*"
+ros-noetic-joint-limits-interface = "*"
+ros-noetic-realtime-tools = "*"
+ros-noetic-eigen-conversions = "*"
+ros-noetic-tf-conversions = "*"
+ros-noetic-xacro = "*"
+ros-noetic-joint-state-publisher = "*"
+ros-noetic-robot-state-publisher = "*"
+ros-noetic-joint-trajectory-controller = "*"
+ros-noetic-urdf = "*"
+# Build libfranka 0.21.3 from the verified source tree against this environment.
+# The prebuilt libfranka and ROS class_loader require incompatible Poco builds.
+eigen = "3.4.*"
+pinocchio = ">=3.4,<4"
+poco = "*"
+console_bridge = "*"
+tinyxml2 = "*"
+fmt = "*"
+gxx = "14.*"
+cmake = "<4"
+make = "*"
+pkg-config = "*"
+catkin_tools = "*"
+empy = "3.3.4.*"
+
+[pypi-dependencies]
+pyrealsense2 = "==2.58.3.10794"
+pyserial = "==3.5"
+opencv-python = "==5.0.0.93"
+
+[tasks]
+libfranka-build = "bash build_libfranka.sh"
+build = { cmd = "catkin build franka_control serl_franka_controllers --workspace . --no-status --limit-status-rate 0.2 --jobs 4 --cmake-args -DCMAKE_BUILD_TYPE=Release -DCATKIN_ENABLE_TESTING=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DFranka_DIR=$PWD/vendor/install/lib/cmake/Franka", depends-on = ["libfranka-build"] }
+shadow = "bash run_client.sh shadow"
+live = "bash run_client.sh live"
+validate = "bash run_client.sh validate"
+control = "bash -c 'source devel/setup.bash && exec roslaunch robot_s0.launch'"
+
+[activation.env]
+ROS_MASTER_URI = "http://127.0.0.1:11311"
+ROS_IP = "127.0.0.1"
+OMP_NUM_THREADS = "1"
+OPENBLAS_NUM_THREADS = "1"
