@@ -13,7 +13,7 @@ If ROS is not running, first run `~/.pixi/bin/pixi run control` in a separate
 terminal in this directory. Stop the old launch with Ctrl-C before replacing it;
 never start two control launches. Controller changes require a restart.
 
-`validate` selects live/full, native learned deltas at 30 Hz, maximum 40 seconds
+`validate` selects live/full, native learned deltas, maximum 40 seconds
 (not maximum hardware joint speed). Each live invocation, including direct Python
 and `pixi run live`, first disconnects the idle ROS hardware, runs existing
 `bin/pnp7_teleop home conf/full100b.conf`, reconnects and verifies all seven joints
@@ -38,6 +38,27 @@ tracking limits. `pixi run shadow` remains a zero-motion observation diagnostic;
 it does **not** Home and is not the live-validation entry point.
 
 The sections below describe earlier tests and historical settings.
+
+### Two-step inference prefixes (current validation behavior)
+
+The full client still requests predictions asynchronously, but executes only
+indices **0 and 1** of each selected chunk, separated by a 30 Hz control tick.
+It then waits for a strictly newer prediction and discards indices 2..9. A new
+prediction does not interrupt the selected two-step prefix; after that prefix,
+the newest available chunk is selected without queuing old predictions.
+
+Waiting does not accumulate deltas, repeat actions, publish pose targets, or
+refresh gripper commands. Camera/state/pose tracking checks continue; existing
+250 ms command watchdogs and 400 ms observation-age checks remain effective.
+The target is still continuous across chunks: this reduces accumulation rate,
+not the accumulated error itself. With observed 160–200 ms inference round trips,
+expect roughly 10–12.5 new actions/s rather than 30, with nonuniform spacing.
+The 40-second duration is unchanged, so task progress may be slower.
+
+`LIVE_READY` and the JSON log report `actions_per_inference=2`; target log indices
+must only be 0 or 1, and `waiting_ticks` counts idle ticks after a prefix. The
+smoke profile also consumes only two actions per prediction, retaining its
+existing amplitude limits. No tracking or collision safeguards were removed.
 
 ### Serial preflight startup ordering
 

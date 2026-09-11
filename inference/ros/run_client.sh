@@ -3,9 +3,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 : "${CONDA_PREFIX:?Run through the inference/ros Pixi environment}"
 # Catkin's generated setup probes unset shell variables (for example ZSH_VERSION).
+# Do not let its argument parser consume client options such as --duration.
+client_args=("$@")
+set --
 set +u
 source devel/setup.bash
 set -u
+set -- "${client_args[@]}"
 export ROS_MASTER_URI=http://127.0.0.1:11311
 export ROS_IP=127.0.0.1
 mode="${1:-shadow}"

@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 import pnp7_policy as old
-from robot_s0_policy import AsyncPolicy, Limits, check_tracking, start_observation_devices
+from robot_s0_policy import AsyncPolicy, Limits, TwoStepChunks, check_tracking, start_observation_devices
 from robotiq_policy import RobotiqPolicy, crc16, decode_status
 
 
@@ -40,6 +40,49 @@ class FakePort:
 
 
 class Tests(unittest.TestCase):
+    @staticmethod
+    def packet(sequence, observed_at=0):
+        return sequence, observed_at, np.zeros(3), np.eye(3), np.arange(70).reshape(10, 7)
+
+    def test_two_steps_then_wait_without_replay(self):
+        chunks = TwoStepChunks()
+        packet = self.packet(1)
+        self.assertIsNone(chunks.next_action(None, 0))
+        for index in (0, 1):
+            result = chunks.next_action(packet, .2 + index / 30)
+            self.assertEqual(result[:2], (1, index))
+            np.testing.assert_array_equal(result[2], packet[4][index])
+        for _ in range(5):
+            self.assertIsNone(chunks.next_action(packet, .3))
+        self.assertEqual(chunks.next_action(self.packet(3, .2), .35)[:2], (3, 0))
+
+    def test_new_result_does_not_interrupt_two_step_prefix(self):
+        chunks = TwoStepChunks()
+        self.assertEqual(chunks.next_action(self.packet(1), .1)[:2], (1, 0))
+        self.assertEqual(chunks.next_action(self.packet(2, .05), .14)[:2], (1, 1))
+        self.assertEqual(chunks.next_action(self.packet(2, .05), .18)[:2], (2, 0))
+
+    def test_selected_chunk_staleness_and_shape(self):
+        chunks = TwoStepChunks()
+        chunks.next_action(self.packet(1), .39)
+        with self.assertRaises(old.SafetyError):
+            chunks.next_action(self.packet(2, .3), .401)
+        for packet in (self.packet(1, 1), (1, 0, None, None, np.zeros((1, 7)))):
+            with self.assertRaises(old.SafetyError):
+                TwoStepChunks().next_action(packet, .1)
+
+    def test_six_hz_inference_uses_only_twelve_actions_per_second(self):
+        chunks = TwoStepChunks()
+        executed = []
+        # 30 Hz control ticks, new inference every five ticks (~167 ms).
+        for tick in range(30):
+            now = tick / 30
+            packet = self.packet(1 + tick // 5, (tick // 5) / 6 - .16)
+            result = chunks.next_action(packet, now)
+            if result is not None:
+                executed.append(result[:2])
+        self.assertEqual(executed, [(seq, i) for seq in range(1, 7) for i in (0, 1)])
+
     def test_camera_warmup_precedes_any_serial_exchange(self):
         events = []
         cameras = [Mock(error=None), Mock(error=None)]

@@ -24,6 +24,7 @@ WRIST = "233622071437"
 GRIPPER_PORT = "/dev/serial/by-id/usb-FTDI_USB_TO_RS-485_DAAQMQW7-if00-port0"
 TRACKING_POSITION_LIMIT = .045
 TRACKING_ROTATION_LIMIT = .30
+STEPS_PER_INFERENCE = 2
 
 
 def check_tracking(position, rotation, measured, measured_rotation):
@@ -121,9 +122,9 @@ class Controller(old.LiveController):
 class AsyncPolicy:
     """One inference in flight; main thread alone publishes robot commands.
 
-    Latest-result receding-horizon control: new chunks replace the unexecuted
-    old suffix. Delta targets remain continuous, with current-state tracking
-    checks on every tick. This is not RTC or latency-compensated training.
+    The command loop consumes only the first two actions of selected chunks.
+    Delta targets remain continuous, with current-state tracking checks on
+    every tick. This is not RTC or latency-compensated training.
     """
     def __init__(self, infer):
         self.infer = infer
@@ -162,6 +163,33 @@ class AsyncPolicy:
         self.thread.join(timeout=2.5)
         if self.thread.is_alive():
             raise old.SafetyError("inference worker did not stop")
+
+
+class TwoStepChunks:
+    """Execute indices 0,1 once, then wait for a strictly newer prediction.
+
+    Finish the selected prefix before selecting the latest available chunk.
+    Waiting never replays an action or consumes indices 2..9. This limits delta
+    accumulation rate; it does not reset accumulated targets to measured pose.
+    """
+    def __init__(self):
+        self.packet = None
+        self.index = 0
+
+    def next_action(self, latest, now):
+        if self.packet is None or self.index >= STEPS_PER_INFERENCE:
+            if latest is None or (self.packet is not None and latest[0] <= self.packet[0]):
+                return None
+            actions = np.asarray(latest[4])
+            if actions.ndim != 2 or actions.shape[0] < STEPS_PER_INFERENCE or actions.shape[1] != 7:
+                raise old.SafetyError("policy chunk must contain at least two 7D actions")
+            self.packet, self.index = latest, 0
+        if not 0 <= now - self.packet[1] <= .4:
+            raise old.SafetyError("selected policy observation is stale or future-dated")
+        sequence, observed_at, _, _, actions = self.packet
+        index = self.index
+        self.index += 1
+        return sequence, index, actions[index], observed_at
 
 
 def run(args):
@@ -203,6 +231,7 @@ def run(args):
     started = None
     worker = None
     targets = []
+    waiting_ticks = 0
     error_message = None
     motion_elapsed_s = None
     output = Path(args.log)
@@ -275,8 +304,8 @@ def run(args):
         deadman.arm()
         conn.close()
         conn = None
-        print("LIVE_READY hold_F3=true release_ends_run=true duration={} profile={} async={}".format(
-            args.duration, args.profile, args.profile == "full"), flush=True)
+        print("LIVE_READY hold_F3=true release_ends_run=true duration={} profile={} async={} actions_per_inference={}".format(
+            args.duration, args.profile, args.profile == "full", STEPS_PER_INFERENCE), flush=True)
         if not deadman.wait_for_press(args.arm_timeout):
             raise old.SafetyError("pedal arm timeout")
         if not deadman.enabled():
@@ -298,8 +327,7 @@ def run(args):
             worker = AsyncPolicy(inference)
             worker.start()
             p, rotation = initial_p.copy(), initial_r.copy()
-            sequence, index = 0, 0
-            actions = None
+            chunks = TwoStepChunks()
             next_tick = time.monotonic()
             while time.monotonic() - started < args.duration and deadman.enabled():
                 packet = worker.latest()
@@ -309,27 +337,30 @@ def run(args):
                     time.sleep(.005)
                     next_tick = time.monotonic()
                     continue
-                if packet[0] != sequence:
-                    sequence, index, actions = packet[0], 0, packet[4]
-                if index >= len(actions):
-                    raise old.SafetyError("action chunk exhausted before next inference")
                 measured, measured_r, _, _, _ = observe()
                 limits.position(measured)
-                action = limits.action(actions[index])
-                p = p + action[:3]
-                rotation = rotation @ old.rpy_to_rotation(action[3:6])
+                selected = chunks.next_action(packet, time.monotonic())
+                if selected is not None:
+                    sequence, index, raw, observed_at = selected
+                    action = limits.action(raw)
+                    p = p + action[:3]
+                    rotation = rotation @ old.rpy_to_rotation(action[3:6])
+                else:
+                    # No repeated target publications or gripper updates while
+                    # waiting. Existing robot/gripper watchdogs stay effective.
+                    waiting_ticks += 1
                 limits.position(p)
                 # The absolute demonstrated workspace replaces the 5 cm smoke
                 # envelope; tracking-error and orientation guards remain.
                 if old.rotation_angle(initial_r.T @ rotation) > 1.5:
                     raise old.SafetyError("full-run rotation limit")
                 check_tracking(p, rotation, measured, measured_r)
-                if controller.publish_policy_target(p, rotation, action[6]):
+                if selected is not None and controller.publish_policy_target(p, rotation, action[6]):
                     commands += 1
                     targets.append(dict(elapsed_s=time.monotonic() - started,
                                         sequence=sequence, index=index, action=action.tolist(),
+                                        observation_age_ms=1000 * (time.monotonic() - observed_at),
                                         target_position=p.tolist(), measured_position=measured.tolist()))
-                index += 1
                 next_tick += 1 / 30
                 delay = next_tick - time.monotonic()
                 if delay < -.05:
@@ -340,7 +371,7 @@ def run(args):
                     next_tick = time.monotonic()  # never send catch-up bursts
         while args.profile == "smoke" and time.monotonic() - started < args.duration and deadman.enabled():
             p, rotation, actions = inference()
-            for raw in actions[:3]:
+            for raw in actions[:STEPS_PER_INFERENCE]:
                 if not deadman.enabled() or time.monotonic() - started >= args.duration:
                     break
                 measured, measured_r, _, _, _ = observe()
@@ -402,7 +433,8 @@ def run(args):
                       duration_requested=args.duration, targets=targets,
                       error=error_message, active_duration_s=motion_elapsed_s,
                       home=home_report, tracking_position_limit_m=TRACKING_POSITION_LIMIT,
-                      tracking_rotation_limit_rad=TRACKING_ROTATION_LIMIT)
+                      tracking_rotation_limit_rad=TRACKING_ROTATION_LIMIT,
+                      actions_per_inference=STEPS_PER_INFERENCE, waiting_ticks=waiting_ticks)
         output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
         if first_images:
             for role, image in zip(("external", "wrist"), first_images):
