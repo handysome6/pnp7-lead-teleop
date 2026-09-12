@@ -68,6 +68,18 @@ def main() -> int:
     ap.add_argument("--max-session-delta", type=float, default=0.50,
                     help="max |q_target - q_origin| per joint, rad")
     ap.add_argument("--lowpass-hz", type=float, default=6.0)
+    ap.add_argument("--notch-hz", type=float, default=4.8,
+                    help="notch centre against the follower's own mode, which "
+                         "was measured at 4.44-5.22 Hz on this rig. 0 disables "
+                         "it. lowpass_hz cannot do this job: it is first order, "
+                         "so reaching 5 Hz drags the 1-2 Hz band the operator "
+                         "works in down with it.")
+    ap.add_argument("--notch-q", type=float, default=2.0,
+                    help="notch width. 2.0 cuts 4.4-5.2 Hz to about a third "
+                         "while leaving 2 Hz at 0.97, for 17 ms of added lag "
+                         "at 1 Hz. Lower widens the stopband and costs more "
+                         "lag; higher risks sitting beside a mode that moves "
+                         "with posture.")
     ap.add_argument("--watchdog-ms", type=int, default=100)
     ap.add_argument("--deadman-device", default=None)
     ap.add_argument("--deadman-key", default="KEY_F3",
@@ -200,6 +212,8 @@ def main() -> int:
         f"enabled_joints={mask}",
         "",
         f"lowpass_hz={args.lowpass_hz}",
+        f"notch_hz={args.notch_hz}",
+        f"notch_q={args.notch_q}",
         f"max_joint_velocity={' '.join(str(v) for v in args.max_velocity)}",
         f"max_joint_acceleration="
         f"{' '.join(str(v) for v in args.max_acceleration)}",
@@ -267,6 +281,10 @@ def main() -> int:
     else:
         print("  home pose      : ABSENT -- `pnp7_teleop home` will refuse; "
               "re-run calibrate.py to capture franka_rest_pose")
+    print(f"  command shaping: lowpass {args.lowpass_hz} Hz, notch "
+          f"{args.notch_hz} Hz Q={args.notch_q}"
+          if args.notch_hz else
+          f"  command shaping: lowpass {args.lowpass_hz} Hz, notch off")
     print(f"  lead deadband  : {args.lead_deadband} counts "
           f"({args.lead_deadband * 360.0 / 4096.0:.3f} deg of lead motion)")
     if args.gripper:

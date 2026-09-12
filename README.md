@@ -458,15 +458,18 @@ Safety chain, applied in this order every cycle:
 
 1. relative mapping `q = q_origin + sign * scale * (lead - lead_origin)`
 2. per-joint session clamp (`max_session_delta`)
-3. **joint-limit clamp on the desired position** - before rate limiting, never
+3. notch on the mapped delta (`notch_hz`, `notch_q`; `notch_hz=0` disables),
+   re-clamped to the session bound afterwards because a notch overshoots a step
+   by ~16% at Q 2.0. See "Follower mode at ~5 Hz" below
+4. **joint-limit clamp on the desired position** - before rate limiting, never
    after; clamping the output instead lets the clamp emit a step of arbitrary
    size that bypasses the velocity and acceleration limits
-4. low-pass filter (`lowpass_hz`), with the filter state clamped so it cannot
+5. low-pass filter (`lowpass_hz`), with the filter state clamped so it cannot
    wind up outside the envelope
-5. velocity limit, capped additionally by the discrete-exact braking bound
+6. velocity limit, capped additionally by the discrete-exact braking bound
    `sqrt(2*a*d + (a*dt)^2) - a*dt`, so a joint never enters the target faster
    than it can stop
-6. acceleration limit
+7. acceleration limit
 
 Releasing the dead-man, a stale lead arm, or `SIGINT` all route to `hold()`,
 which decays velocity to zero and freezes. A session only reports
@@ -475,6 +478,42 @@ rejects a motion that ends with non-zero velocity.
 
 Config values are validated against compiled ceilings and can only ever be more
 conservative than them.
+
+Every run prints the shaping actually in force -- `command shaping:
+lowpass_hz=6 deadband=2 counts notch=4.8Hz Q=2` -- in `robot` and `dry` mode
+alike, so a recorded episode's `bridge.log` says what produced it. The CSV
+cannot answer that question after the fact.
+
+#### Follower mode at ~5 Hz
+
+Measured 2026-09-12 over four deliberate grasp approaches
+(`artifacts/vibration_audit_20260912`): descending toward the cube, the arm
+develops an oscillation the command does not contain. `q_robot - q_target`
+reaches 0.068-0.098 deg at 4.44-5.22 Hz carrying 9-18 Nm of same-band J2
+torque, and it grows about twentyfold as the arm reaches down, peaking at the
+lowest point. There is no contact -- the operator confirmed it and `O_F_ext`
+agrees, with Fz less negative at the bottom than high up. What keeps exciting
+the mode is single-count stepping of the lead arm: one count is 1.5 mrad, which
+at this reach is ~1.1 mm of fingertip travel, and a step carries energy
+everywhere.
+
+`lowpass_hz` is the wrong instrument. Being first order, reaching 5 Hz means
+dragging the 1-2 Hz band the operator works in down too: at 3 Hz it cuts 5 Hz
+only to 0.514 while adding 24.9 ms of lag at 1 Hz. The notch at 4.8 Hz, Q 2.0
+cuts 4.4-5.2 Hz to 0.31-0.33 for 17.3 ms, and leaves 2 Hz at 0.970. Replaying
+the recorded lead signal through it drops the 4-6 Hz band to 0.42-0.68 of its
+original amplitude while the 1-2.5 Hz band lands within 3% of unchanged.
+
+Retune `notch_hz` if the mode moves. Its frequency is the Franka's fixed joint
+impedance over the arm's effective inertia, so a different tool or a distinctly
+different working posture will shift it.
+
+Two things this does not fix. The tremble the operator sees at the bottom is
+about 9 mm peak-to-peak over 1.5-6 Hz, and only ~1.7 mm of that is the arm --
+the remaining ~8 mm below 2.5 Hz is hand motion, where `q_target` exceeds the
+arm-generated part by 10-50x and shares a band with the operator's intent, so
+no filter reaches it. And the tool is still declared as a Franka Hand except
+for its mass; see the Robotiq notes.
 
 ### Build and run
 

@@ -180,6 +180,27 @@ struct Config {
   double gripper_open_width{0.0};
 
   double lowpass_hz{6.0};
+  // Notch on the mapped lead delta, against the arm's own ~5 Hz mode.
+  //
+  // Measured 2026-09-12 (artifacts/vibration_audit_20260912): descending into a
+  // grasp, the follower develops an oscillation the command does not contain --
+  // q_robot - q_target reaches 0.068..0.098 deg at 4.44..5.22 Hz with 9..18 Nm
+  // of same-band J2 torque, growing ~20x as the arm reaches down and peaking at
+  // the lowest point. The lead arm holds only ~1.6 counts there, so what keeps
+  // exciting the mode is single-count stepping: one count is 1.5 mrad, which at
+  // this reach is ~1.1 mm of fingertip travel, and a step carries energy at
+  // every frequency.
+  //
+  // lowpass_hz cannot do this job. It is first order, so reaching 5 Hz means
+  // dragging the 1-2 Hz band the operator works in down with it: at 3 Hz it
+  // cuts 5 Hz only to 0.514 while adding 24.9 ms of lag at 1 Hz. This notch at
+  // Q 2.0 cuts 4.4..5.2 Hz to 0.31..0.33 for 17.3 ms, and leaves 2 Hz at 0.970.
+  //
+  // 0 disables. Retune f0 if the mode moves -- it is set by the Franka's fixed
+  // joint impedance over the arm's effective inertia, so a different tool or a
+  // different working posture will shift it.
+  double notch_hz{4.8};
+  double notch_q{2.0};
   // Per joint. The Franka's own dq limits differ across the arm (2.175 rad/s
   // on J1-J4, 2.61 on J5-J7), and a human rotates a wrist far faster than a
   // shoulder, so one global cap throttles the wrist while the big joints idle.
@@ -282,6 +303,14 @@ void validateConfig(const Config& c) {
     throw std::invalid_argument("deadman_device must be set");
   if (c.lowpass_hz < 0.5 || c.lowpass_hz > 50.0)
     throw std::invalid_argument("lowpass_hz must be within 0.5..50");
+  // 100 Hz leaves margin under the 500 Hz Nyquist of the 1 kHz callback, and a
+  // notch that high would be shaping noise the lowpass has already removed.
+  if (c.notch_hz != 0.0 && (c.notch_hz < 0.5 || c.notch_hz > 100.0))
+    throw std::invalid_argument("notch_hz must be 0 or within 0.5..100");
+  // Below ~0.2 the stopband swallows the operator's own band; above ~20 it is
+  // too narrow to stay on a mode that moves with posture.
+  if (c.notch_q < 0.2 || c.notch_q > 20.0)
+    throw std::invalid_argument("notch_q must be within 0.2..20");
   for (int i = 0; i < kNumJoints; ++i) {
     if (c.max_joint_velocity[i] <= 0.0 ||
         c.max_joint_velocity[i] > kCeilJointVelocity)
@@ -369,6 +398,8 @@ Config loadConfig(const std::string& path) {
     else if (key == "status_path") c.status_path = value;
     else if (key == "lead_deadband") c.lead_deadband = std::stod(value);
     else if (key == "lowpass_hz") c.lowpass_hz = std::stod(value);
+    else if (key == "notch_hz") c.notch_hz = std::stod(value);
+    else if (key == "notch_q") c.notch_q = std::stod(value);
     else if (key == "max_joint_velocity")
       fillPerJoint(c.max_joint_velocity, value, "max_joint_velocity");
     else if (key == "max_joint_acceleration")
@@ -744,9 +775,9 @@ const char* stateName(State s) {
   return "?";
 }
 
-// Applies, in order: relative mapping, session clamp, low-pass, velocity limit,
-// acceleration limit, joint-limit clamp. Each stage is intentionally separate
-// so a single one can be tested in isolation.
+// Applies, in order: relative mapping, session clamp, notch, low-pass, velocity
+// limit, acceleration limit, joint-limit clamp. Each stage is intentionally
+// separate so a single one can be tested in isolation.
 class SafetyChain {
  public:
   explicit SafetyChain(const Config& config) : c_(config) {}
@@ -756,12 +787,30 @@ class SafetyChain {
     target_ = q;
     prev_target_ = q;
     prev_velocity_.fill(0.0);
+    notch_primed_ = false;
   }
 
   std::array<double, kNumJoints> step(
       const std::array<double, kNumJoints>& q_origin,
       const std::array<double, kNumJoints>& delta_lead, double dt) {
     std::array<double, kNumJoints> desired = target_;
+
+    // Notch coefficients come from the actual period, like the low-pass below:
+    // the callback is nominally 1 kHz but nothing guarantees it. Both trig calls
+    // are per step, not per joint -- f0 and Q are shared, only the state is not.
+    const bool notch_on = c_.notch_hz > 0.0;
+    double nb0 = 1.0, nb1 = 0.0, nb2 = 0.0, na1 = 0.0, na2 = 0.0;
+    if (notch_on) {
+      const double w0 = 2.0 * kPi * c_.notch_hz * std::max(dt, 1e-6);
+      const double cos_w0 = std::cos(w0);
+      const double alpha_n = std::sin(w0) / (2.0 * c_.notch_q);
+      const double a0 = 1.0 + alpha_n;
+      nb0 = 1.0 / a0;
+      nb1 = -2.0 * cos_w0 / a0;
+      nb2 = 1.0 / a0;
+      na1 = -2.0 * cos_w0 / a0;
+      na2 = (1.0 - alpha_n) / a0;
+    }
 
     for (int i = 0; i < kNumJoints; ++i) {
       if (!c_.enabled[i]) {
@@ -770,8 +819,16 @@ class SafetyChain {
       }
       double d = c_.sign[i] * c_.scale[i] * delta_lead[i];
       d = std::clamp(d, -c_.max_session_delta, c_.max_session_delta);
+      if (notch_on) {
+        d = notchStep(i, d, nb0, nb1, nb2, na1, na2);
+        // A notch overshoots a step by ~16% at Q 2.0, so re-clamp and keep the
+        // session bound an actual bound. The filter's own state is deliberately
+        // left unsaturated: clamping the state is what makes a filter wind up.
+        d = std::clamp(d, -c_.max_session_delta, c_.max_session_delta);
+      }
       desired[i] = q_origin[i] + d;
     }
+    notch_primed_ = true;
 
     // Joint limits are enforced HERE, on the desired position, before any rate
     // limiting. Clamping the output instead would let the clamp emit a step of
@@ -842,6 +899,10 @@ class SafetyChain {
     }
     filtered_ = prev_target_;
     target_ = prev_target_;
+    // Re-engaging the clutch resets `origin`, so the next delta restarts near
+    // zero. Dropping the priming makes the notch restart from that value rather
+    // than from history belonging to the pose the operator has already left.
+    notch_primed_ = false;
     return target_;
   }
 
@@ -856,11 +917,41 @@ class SafetyChain {
   }
 
  private:
+  // Direct form 1 biquad, one state per joint.
+  //
+  // On the first sample of a session the state is primed to the current input
+  // instead of to zero. A notch passes a constant through unchanged, so priming
+  // this way starts it already in steady state and engaging the clutch emits no
+  // start-up transient -- seeding zeros would inject a step the size of the
+  // whole delta.
+  double notchStep(int i, double x, double b0, double b1, double b2,
+                   double a1, double a2) {
+    if (!notch_primed_) {
+      nx1_[i] = x;
+      nx2_[i] = x;
+      ny1_[i] = x;
+      ny2_[i] = x;
+      return x;
+    }
+    const double y = b0 * x + b1 * nx1_[i] + b2 * nx2_[i]
+                   - a1 * ny1_[i] - a2 * ny2_[i];
+    nx2_[i] = nx1_[i];
+    nx1_[i] = x;
+    ny2_[i] = ny1_[i];
+    ny1_[i] = y;
+    return y;
+  }
+
   Config c_;
   std::array<double, kNumJoints> filtered_{};
   std::array<double, kNumJoints> target_{};
   std::array<double, kNumJoints> prev_target_{};
   std::array<double, kNumJoints> prev_velocity_{};
+  std::array<double, kNumJoints> nx1_{};
+  std::array<double, kNumJoints> nx2_{};
+  std::array<double, kNumJoints> ny1_{};
+  std::array<double, kNumJoints> ny2_{};
+  bool notch_primed_{false};
 };
 
 // Hysteresis (backlash) operator on the raw lead counts.
@@ -1483,6 +1574,62 @@ int runSelfTest(const Config& config) {
     requireTest(chain5.target()[i] <= kQMax[i] - kJointLimitMargin + 1e-6,
                 "joint upper limit");
 
+  // Notch: the arm's own ~5 Hz mode must not be fed from the lead arm, while
+  // the 1-2 Hz band the operator actually works in has to survive. lowpass_hz
+  // is parked at 50 so what this measures is the notch and not the low-pass.
+  {
+    Config cn = c;
+    // Pinned, not inherited: this has to exercise the implementation even when
+    // the config being checked has the notch tuned elsewhere or switched off.
+    cn.notch_hz = 4.8;
+    cn.notch_q = 2.0;
+    cn.lowpass_hz = 50.0;
+    cn.max_joint_velocity.fill(kCeilJointVelocity);
+    cn.max_joint_acceleration.fill(kCeilJointAcceleration);
+    cn.max_session_delta = 0.5;
+    cn.scale.fill(1.0);
+    cn.sign.fill(1.0);
+    // Small enough that neither the rate limit nor the braking cap binds: at
+    // 4.8 Hz this peaks at 0.06 rad/s and 1.8 rad/s^2.
+    const double amp = 0.002;
+    auto sweep = [&](const Config& cfg, double hz) {
+      SafetyChain ch(cfg);
+      ch.seed(q0);
+      double lo = 1e9, hi = -1e9;
+      const int n = static_cast<int>(4.0 / dt);
+      for (int k = 0; k < n; ++k) {
+        std::array<double, kNumJoints> d{};
+        d.fill(amp * std::sin(2.0 * kPi * hz * k * dt));
+        const auto tgt = ch.step(q0, d, dt);
+        if (k > n / 2) {   // second half only: let the start-up settle
+          lo = std::min(lo, tgt[1] - q0[1]);
+          hi = std::max(hi, tgt[1] - q0[1]);
+        }
+      }
+      return hi - lo;
+    };
+    Config coff = cn;
+    coff.notch_hz = 0.0;
+    const double pp_in = 2.0 * amp;
+    const double pp_notched = sweep(cn, cn.notch_hz);
+    const double pp_passed = sweep(cn, 1.0);
+    const double pp_unfiltered = sweep(coff, cn.notch_hz);
+    requireTest(pp_notched < 0.25 * pp_in, "notch attenuates its own frequency");
+    requireTest(pp_passed > 0.90 * pp_in, "notch passes the 1 Hz operator band");
+    requireTest(pp_unfiltered > 0.70 * pp_in, "notch_hz 0 disables the notch");
+    requireTest(pp_notched < 0.40 * pp_unfiltered,
+                "notch measurably cuts what it is aimed at");
+    // A constant hand offset must arrive intact: this notch has unity DC gain,
+    // and priming means it is in steady state from the first sample.
+    SafetyChain dc(cn);
+    dc.seed(q0);
+    std::array<double, kNumJoints> held{};
+    held.fill(0.01);
+    for (int k = 0; k < 3000; ++k) dc.step(q0, held, dt);
+    requireTest(std::fabs((dc.target()[1] - q0[1]) - 0.01) < 1e-6,
+                "notch passes a constant offset unchanged");
+  }
+
   // Hysteresis deadband: single-count chatter must not propagate, but real
   // motion must still track continuously once it leaves the band.
   {
@@ -1578,7 +1725,21 @@ int runSelfTest(const Config& config) {
   return 0;
 }
 
+// Worth a line of its own in every bridge.log, and in dry runs too: which
+// shaping was in force is exactly what an after-the-fact vibration
+// investigation needs, and it cannot be recovered from the CSV.
+void printCommandShaping(const Config& config) {
+  std::cout << "command shaping: lowpass_hz=" << config.lowpass_hz
+            << " deadband=" << config.lead_deadband << " counts notch=";
+  if (config.notch_hz > 0.0)
+    std::cout << config.notch_hz << "Hz Q=" << config.notch_q;
+  else
+    std::cout << "off";
+  std::cout << "\n";
+}
+
 int runDry(const Config& config, double duration_s, const std::string& log_path) {
+  printCommandShaping(config);
   LeadArmReader lead(config);
   lead.open();
   lead.assertTorqueDisabled();
@@ -1717,6 +1878,7 @@ int runRobot(const Config& config, double duration_s,
   for (int i = 0; i < kNumJoints; ++i)
     if (config.enabled[i]) std::cout << " J" << (i + 1);
   std::cout << "  scale=" << config.scale[6] << "\n";
+  printCommandShaping(config);
 
   std::unique_ptr<GripperInterface> gripper;
   if (config.gripper_enabled) {
