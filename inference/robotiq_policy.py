@@ -51,6 +51,8 @@ class RobotiqPolicy:
         self.target_time = 0.0
         self.candidate = None
         self.candidate_count = 0
+        self.vote_source = None
+        self.switches = []
         self.commands = 0
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
@@ -130,18 +132,34 @@ class RobotiqPolicy:
             self.motion_mode = True
 
     def update(self, value):
-        desired = 0 if value >= .75 else 255 if value <= .25 else None
         with self.lock:
             self.target_time = time.monotonic()
-            if desired is None or desired == self.target:
+            self._consider(value)
+
+    def vote(self, value, source):
+        """One vote per policy chunk (`source`); repeats only keep GoTo fresh.
+
+        Two consecutive agreeing chunks are required, so a single flow-noise
+        sample cannot open a held grasp however many of its actions execute.
+        """
+        with self.lock:
+            self.target_time = time.monotonic()
+            if source != self.vote_source:
+                self.vote_source = source
+                self._consider(value)
+
+    def _consider(self, value):
+        desired = 0 if value >= .75 else 255 if value <= .25 else None
+        if desired is None or desired == self.target:
+            self.candidate, self.candidate_count = None, 0
+        elif desired != self.candidate:
+            self.candidate, self.candidate_count = desired, 1
+        else:
+            self.candidate_count += 1
+            if self.candidate_count >= 2:
+                self.target = desired
                 self.candidate, self.candidate_count = None, 0
-            elif desired != self.candidate:
-                self.candidate, self.candidate_count = desired, 1
-            else:
-                self.candidate_count += 1
-                if self.candidate_count >= 2:
-                    self.target = desired
-                    self.candidate, self.candidate_count = None, 0
+                self.switches.append((time.monotonic(), desired))
 
     def emergency_stop(self):
         with self.lock:

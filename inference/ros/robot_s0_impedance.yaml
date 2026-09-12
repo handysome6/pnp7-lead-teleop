@@ -3,20 +3,23 @@ cartesian_impedance_controller:
   arm_id: fr3
   joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
 
-# Conservative validation parameters; robot collision reflexes are untouched.
+# Validation parameters; robot collision reflexes are untouched. On 2026-09-12
+# translation stiffness/damping went 1000/63 -> 2000/89 (SERL default pair, same
+# damping ratio) and the translational clip 5 -> 10 mm, so corrections at the
+# extended grasp pose overcome ~10 N of resistance. Pull is at most ~20 N per axis.
 cartesian_impedance_controllerdynamic_reconfigure_compliance_param_node:
-  translational_stiffness: 1000.0
-  translational_damping: 63.0
+  translational_stiffness: 2000.0
+  translational_damping: 89.0
   rotational_stiffness: 80.0
   rotational_damping: 7.0
   nullspace_stiffness: 0.2
   joint1_nullspace_stiffness: 1.0
-  translational_clip_neg_x: 0.005
-  translational_clip_neg_y: 0.005
-  translational_clip_neg_z: 0.005
-  translational_clip_x: 0.005
-  translational_clip_y: 0.005
-  translational_clip_z: 0.005
+  translational_clip_neg_x: 0.010
+  translational_clip_neg_y: 0.010
+  translational_clip_neg_z: 0.010
+  translational_clip_x: 0.010
+  translational_clip_y: 0.010
+  translational_clip_z: 0.010
   rotational_clip_neg_x: 0.03
   rotational_clip_neg_y: 0.03
   rotational_clip_neg_z: 0.03

@@ -170,16 +170,20 @@ class PolicyConnection:
             raise RuntimeError("policy server health failed: {}".format(response))
         return response
 
-    def infer(self, state, base_rgb, wrist_rgb, prompt):
+    def infer(self, state, base_rgb, wrist_rgb, prompt, seed=None):
+        """`seed` is honored only by per-request-seed servers; others ignore it."""
         request_id = self.request_id
         self.request_id += 1
+        metadata = {
+            "token": self.token,
+            "request_id": request_id,
+            "state": np.asarray(state, dtype=np.float32).tolist(),
+            "prompt": prompt,
+        }
+        if seed is not None:
+            metadata["seed"] = int(seed)
         payload = encode_inference_request(
-            {
-                "token": self.token,
-                "request_id": request_id,
-                "state": np.asarray(state, dtype=np.float32).tolist(),
-                "prompt": prompt,
-            },
+            metadata,
             np.ascontiguousarray(base_rgb, dtype=np.uint8),
             np.ascontiguousarray(wrist_rgb, dtype=np.uint8),
         )

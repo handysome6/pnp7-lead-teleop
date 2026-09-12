@@ -8,7 +8,9 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 import pnp7_policy as old
-from robot_s0_policy import AsyncPolicy, Limits, TwoStepChunks, check_tracking, start_observation_devices
+from robot_s0_policy import (AsyncPolicy, Controller, Limits, PrefixChunks, check_tracking, gripper_vote_value,
+                             parse_args,
+                             start_observation_devices)
 from robotiq_policy import RobotiqPolicy, crc16, decode_status
 
 
@@ -45,7 +47,7 @@ class Tests(unittest.TestCase):
         return sequence, observed_at, np.zeros(3), np.eye(3), np.arange(70).reshape(10, 7)
 
     def test_two_steps_then_wait_without_replay(self):
-        chunks = TwoStepChunks()
+        chunks = PrefixChunks()
         packet = self.packet(1)
         self.assertIsNone(chunks.next_action(None, 0))
         for index in (0, 1):
@@ -57,22 +59,25 @@ class Tests(unittest.TestCase):
         self.assertEqual(chunks.next_action(self.packet(3, .2), .35)[:2], (3, 0))
 
     def test_new_result_does_not_interrupt_two_step_prefix(self):
-        chunks = TwoStepChunks()
+        chunks = PrefixChunks()
         self.assertEqual(chunks.next_action(self.packet(1), .1)[:2], (1, 0))
         self.assertEqual(chunks.next_action(self.packet(2, .05), .14)[:2], (1, 1))
         self.assertEqual(chunks.next_action(self.packet(2, .05), .18)[:2], (2, 0))
 
-    def test_selected_chunk_staleness_and_shape(self):
-        chunks = TwoStepChunks()
-        chunks.next_action(self.packet(1), .39)
-        with self.assertRaises(old.SafetyError):
-            chunks.next_action(self.packet(2, .3), .401)
+    def test_late_actions_are_skipped_never_executed(self):
+        chunks = PrefixChunks()
+        self.assertEqual(chunks.next_action(self.packet(1), .39)[:2], (1, 0))
+        self.assertIsNone(chunks.next_action(self.packet(2, .3), .45))   # index 1 of seq 1 runs 417 ms late
+        self.assertIsNone(chunks.next_action(self.packet(3, .01), .45))  # seq 3 is 440 ms late on arrival
+        self.assertIsNone(chunks.next_action(self.packet(3, .01), .48))  # never replayed while waiting
+        self.assertEqual(chunks.next_action(self.packet(4, .3), .5)[:2], (4, 0))
+        self.assertEqual([(s["sequence"], s["index"]) for s in chunks.skipped], [(1, 1), (3, 0)])
         for packet in (self.packet(1, 1), (1, 0, None, None, np.zeros((1, 7)))):
             with self.assertRaises(old.SafetyError):
-                TwoStepChunks().next_action(packet, .1)
+                PrefixChunks().next_action(packet, .1)
 
     def test_six_hz_inference_uses_only_twelve_actions_per_second(self):
-        chunks = TwoStepChunks()
+        chunks = PrefixChunks()
         executed = []
         # 30 Hz control ticks, new inference every five ticks (~167 ms).
         for tick in range(30):
@@ -82,6 +87,34 @@ class Tests(unittest.TestCase):
             if result is not None:
                 executed.append(result[:2])
         self.assertEqual(executed, [(seq, i) for seq in range(1, 7) for i in (0, 1)])
+
+    def test_ten_step_prefix_bounds_lateness_per_action(self):
+        chunks = PrefixChunks(10)
+        # Selected 250 ms after its observation: every action then runs 250 ms after its intended time.
+        self.assertEqual([chunks.next_action(self.packet(1), .25 + i / 30)[:2] for i in range(10)],
+                         [(1, i) for i in range(10)])
+        self.assertIsNone(chunks.next_action(self.packet(1), .6))
+        chunks = PrefixChunks(10)
+        for now in (.30, .34, .38, .42):
+            self.assertIsNotNone(chunks.next_action(self.packet(2), now))
+        self.assertIsNone(chunks.next_action(self.packet(2), .55))  # a stalled loop: index 4 runs 417 ms late
+        self.assertEqual((chunks.skipped[-1]["sequence"], chunks.skipped[-1]["index"]), (2, 4))
+        with self.assertRaises(old.SafetyError):
+            PrefixChunks(10).next_action((1, 0, None, None, np.zeros((3, 7))), .1)
+
+    def test_full_profile_duration_and_prefix_options(self):
+        base = ["robot_s0_policy.py", "--mode", "live", "--log", "x.json"]
+        with patch("sys.argv", base + ["--profile", "full", "--duration", "90", "--actions-per-inference", "10"]):
+            args = parse_args()
+            self.assertEqual((args.duration, args.actions_per_inference), (90, 10))
+        with patch("sys.argv", base + ["--profile", "full"]):
+            args = parse_args()
+            self.assertEqual((args.actions_per_inference, args.gripper_vote), (2, "tail"))
+        for extra in (["--profile", "full", "--duration", "91"], ["--actions-per-inference", "4"],
+                      ["--profile", "full", "--actions-per-inference", "11"]):
+            with patch("sys.argv", base + extra), patch("sys.stderr", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parse_args()
 
     def test_camera_warmup_precedes_any_serial_exchange(self):
         events = []
@@ -115,6 +148,57 @@ class Tests(unittest.TestCase):
             with self.assertRaises(old.SafetyError):
                 check_tracking(np.array([distance, 0, 0]), old.rpy_to_rotation([0, 0, angle]), p, r)
 
+    def test_client_tracking_stop_off_is_explicit_and_full_only(self):
+        base = ["robot_s0_policy.py", "--mode", "live", "--log", "x.json"]
+        with patch("sys.argv", base + ["--profile", "full"]):
+            args = parse_args()
+            self.assertEqual((args.client_tracking_stop, args.target_lead_cap_mm), ("on", None))
+        off = base + ["--profile", "full", "--client-tracking-stop", "off"]
+        with patch("sys.argv", off):
+            args = parse_args()
+            self.assertEqual((args.client_tracking_stop, args.target_lead_cap_mm, args.target_lead_cap_rad),
+                             ("off", 20.0, .10))
+        with patch("sys.argv", off + ["--target-lead-cap-mm", "15"]):
+            self.assertEqual(parse_args().target_lead_cap_mm, 15.0)
+        for argv in (base + ["--client-tracking-stop", "off"],            # smoke profile
+                     base + ["--profile", "full", "--target-lead-cap-mm", "15"],  # cap without off
+                     off + ["--target-lead-cap-mm", "60"], off + ["--target-lead-cap-rad", "0"],
+                     off + ["--target-lead-cap-mm", "nan"]):
+            with patch("sys.argv", argv), patch("sys.stderr", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parse_args()
+
+    def test_policy_step_and_noise_seed_select_known_server(self):
+        base = ["robot_s0_policy.py", "--mode", "live", "--log", "x.json"]
+        with patch("sys.argv", base):
+            args = parse_args()
+            self.assertEqual((args.policy_step, args.noise_seed), (7500, "fixed"))
+        with patch("sys.argv", base + ["--policy-step", "2500"]):
+            self.assertEqual(parse_args().policy_step, 2500)
+        with patch("sys.argv", base + ["--noise-seed", "per-request"]):
+            self.assertEqual(parse_args().noise_seed, "per-request")
+        for extra in (["--policy-step", "1234"], ["--policy-step", "2500", "--noise-seed", "per-request"]):
+            with patch("sys.argv", base + extra), patch("sys.stderr", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parse_args()
+
+    def test_seed_is_sent_only_when_requested(self):
+        from protocol import decode_inference_request
+        connection = old.PolicyConnection.__new__(old.PolicyConnection)
+        connection.sock, connection.token, connection.request_id = Mock(), "t", 0
+        sent = []
+        def reply(request_id):
+            return {"ok": True, "request_id": request_id, "actions": np.zeros((10, 7)).tolist(), "inference_ms": 1.0}
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        with patch("pnp7_policy.send_frame", lambda sock, payload: sent.append(payload)), \
+                patch("pnp7_policy.recv_frame", return_value=b""), \
+                patch("pnp7_policy.decode_json", side_effect=[reply(0), reply(1)]):
+            connection.infer(np.zeros(10), image, image, "p")
+            connection.infer(np.zeros(10), image, image, "p", seed=42)
+        metadata = [decode_inference_request(payload)[0] for payload in sent]
+        self.assertNotIn("seed", metadata[0])
+        self.assertEqual(metadata[1]["seed"], 42)
+
     def test_full_profile_and_async_errors(self):
         limits = Limits(Path(__file__).parent / "ros/norm_stats_40merged.json", "full")
         raw = np.array([.002, -.001, .003, .004, -.003, .002, .9])
@@ -131,7 +215,9 @@ class Tests(unittest.TestCase):
         self.assertIsNotNone(packet)
         self.assertEqual(packet[4].shape, (10, 7))
         worker.close()
-        worker.packet = (packet[0], time.monotonic() - .401, *packet[2:])
+        worker.packet = (packet[0], time.monotonic() - .5, *packet[2:])
+        self.assertIs(worker.latest(), worker.packet)  # waiting for a newer chunk is not an error
+        worker.packet = (packet[0], time.monotonic() - 1.001, *packet[2:])
         with self.assertRaises(old.SafetyError):
             worker.latest()
         worker.error = RuntimeError("test lost network")
@@ -196,6 +282,52 @@ class Tests(unittest.TestCase):
                 self.assertEqual(writes[-1][7], 1)  # stale policy clears GoTo
             finally:
                 grip.close()
+
+    def test_gripper_vote_value_uses_planned_end_state(self):
+        outlier, release = np.zeros((10, 7)), np.zeros((10, 7))
+        outlier[:, 6] = [.98, .94, .89, .98, .96, .10, .04, .04, .03, .04]  # dropped a cube mid-transport
+        release[:, 6] = [.02, .02, .03, .02, .02, .9, 1, 1, 1.03, 1]
+        self.assertLessEqual(gripper_vote_value(outlier, "tail"), .25)  # open-first noise votes closed
+        self.assertGreaterEqual(gripper_vote_value(release, "tail"), .75)  # planned release votes open
+        self.assertTrue(.25 < gripper_vote_value(outlier, "chunk") < .75)
+        self.assertTrue(.25 < gripper_vote_value(release, "chunk") < .75)
+
+    def test_gripper_chunk_votes_need_two_chunks(self):
+        with patch("robotiq_policy.serial.Serial", FakePort), patch("robotiq_policy.fcntl.ioctl"):
+            grip = RobotiqPolicy("fake")
+            try:
+                grip.target = 255  # holding a grasp
+                for value, source in ((.98, 7), (.98, 7), (.98, 7), (.02, 8)):
+                    grip.vote(value, source)
+                self.assertEqual(grip.target, 255)  # one outlier chunk never opens, however many actions run
+                grip.vote(.98, 9)
+                self.assertEqual(grip.target, 255)
+                grip.vote(.99, 10)
+                self.assertEqual((grip.target, grip.switches[-1][1]), (0, 0))  # two consecutive chunks agree
+                for value, source in ((.02, 11), (.5, 12), (.02, 13)):
+                    grip.vote(value, source)
+                self.assertEqual(grip.target, 0)  # an undecided chunk resets the count
+                before = grip.target_time
+                time.sleep(.01)
+                grip.vote(.02, 13)
+                self.assertGreater(grip.target_time, before)  # repeated actions still keep GoTo fresh
+                self.assertEqual(grip.target, 0)
+            finally:
+                grip.close()
+
+    def test_controller_routes_chunk_votes(self):
+        controller = Controller(Mock(), Mock(), Mock())
+        controller.deadman = Mock(enabled=Mock(return_value=True))
+        controller.gripper = Mock()
+        with patch.object(Controller, "_pose_message", return_value="pose"):
+            self.assertTrue(controller.publish_policy_target(np.zeros(3), np.eye(3), .02, source=5))
+            controller.gripper.vote.assert_called_once_with(.02, 5)
+            controller.gripper.update.assert_not_called()
+            self.assertTrue(controller.publish_policy_target(np.zeros(3), np.eye(3), .9))
+            controller.gripper.update.assert_called_once_with(.9)
+            controller.deadman.enabled.return_value = False
+            self.assertFalse(controller.publish_policy_target(np.zeros(3), np.eye(3), .02, source=6))
+        self.assertEqual(controller.publisher.publish.call_count, 2)
 
     def test_bad_crc(self):
         with self.assertRaises(RuntimeError):

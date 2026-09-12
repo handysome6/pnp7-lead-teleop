@@ -16,23 +16,25 @@ import numpy as np
 
 import pnp7_policy as old
 from robotiq_policy import RobotiqPolicy
+from tracking_governor import (TrackingGovernor, TrackingMonitor, apply_action, cap_lead, check_tracking,
+                               TRACKING_POSITION_LIMIT, TRACKING_ROTATION_LIMIT)
 
 
-MODEL_ID = "pi05_pnp7_40merged_step7500"
+# (40merged checkpoint, per-request noise seed) -> robot-s1 server port. Deployed
+# servers reset seed 0 before every inference; the seedexp server takes a seed
+# per request. Model id and seed capability are verified via health.
+POLICY_SERVERS = {(7500, False): 5559, (2500, False): 5560, (5000, False): 5561, (7500, True): 5562}
 EXTERNAL = "317622072022"
 WRIST = "233622071437"
 GRIPPER_PORT = "/dev/serial/by-id/usb-FTDI_USB_TO_RS-485_DAAQMQW7-if00-port0"
-TRACKING_POSITION_LIMIT = .045
-TRACKING_ROTATION_LIMIT = .30
+# Default leading actions executed per fresh chunk (the full profile may use 2-4).
 STEPS_PER_INFERENCE = 2
-
-
-def check_tracking(position, rotation, measured, measured_rotation):
-    distance = np.linalg.norm(position - measured)
-    angle = old.rotation_angle(measured_rotation.T @ rotation)
-    if not np.isfinite(distance + angle) or distance > TRACKING_POSITION_LIMIT or angle > TRACKING_ROTATION_LIMIT:
-        raise old.SafetyError("target tracking error limit: translation_mm={:.2f}, rotation_rad={:.4f}".format(
-            1000 * distance, angle))
+# Tail gripper vote: mean of the last predicted steps, the state a chunk plans to end in.
+GRIPPER_TAIL_STEPS = 5
+# Action k of a chunk is meant for k/30 s after its observation; never run it later than this.
+MAX_ACTION_LATENESS_S = .4
+# End the run only when no newer prediction has arrived for this long.
+MAX_POLICY_SILENCE_S = 1.0
 
 
 class Camera(old.CameraStream):
@@ -112,17 +114,40 @@ class Limits:
         return action
 
 
+def gripper_vote_value(chunk, mode):
+    """Clipped gripper value one chunk votes with.
+
+    tail: mean of its last GRIPPER_TAIL_STEPS steps, so an open-first-then-closed
+    noise sample votes closed while a planned release votes open. chunk: mean of
+    the whole horizon.
+    """
+    horizon = np.clip(np.asarray(chunk, dtype=float)[:, 6], 0, 1)
+    return float((horizon[-GRIPPER_TAIL_STEPS:] if mode == "tail" else horizon).mean())
+
+
 class Controller(old.LiveController):
     def _pose_message(self, position, rotation):
         message = super()._pose_message(position, rotation)
         message.header.frame_id = "fr3_link0"
         return message
 
+    def publish_policy_target(self, position, rotation, gripper_value, source=None):
+        """With `source`, the gripper gets one debounced vote per policy chunk."""
+        if source is None:
+            return super().publish_policy_target(position, rotation, gripper_value)
+        with self.command_lock:
+            if self.deadman is None or not self.deadman.enabled():
+                return False
+            self.publisher.publish(self._pose_message(position, rotation))
+            if self.gripper is not None:
+                self.gripper.vote(gripper_value, source)
+            return True
+
 
 class AsyncPolicy:
     """One inference in flight; main thread alone publishes robot commands.
 
-    The command loop consumes only the first two actions of selected chunks.
+    The command loop consumes only a short leading prefix of selected chunks.
     Delta targets remain continuous, with current-state tracking checks on
     every tick. This is not RTC or latency-compensated training.
     """
@@ -154,8 +179,11 @@ class AsyncPolicy:
             raise old.SafetyError("async policy failed: {}".format(self.error))
         with self.lock:
             packet = self.packet
-        if packet is not None and time.monotonic() - packet[1] > .4:
-            raise old.SafetyError("policy observation is older than 400 ms")
+        # Waiting for a newer chunk is safe (nothing is published); stale actions
+        # are dropped by PrefixChunks. Only a silent worker/server ends the run.
+        if packet is not None and time.monotonic() - packet[1] > MAX_POLICY_SILENCE_S:
+            raise old.SafetyError("newest policy observation is older than {:.0f} ms".format(
+                1000 * MAX_POLICY_SILENCE_S))
         return packet
 
     def close(self):
@@ -165,27 +193,38 @@ class AsyncPolicy:
             raise old.SafetyError("inference worker did not stop")
 
 
-class TwoStepChunks:
-    """Execute indices 0,1 once, then wait for a strictly newer prediction.
+class PrefixChunks:
+    """Execute indices 0..steps-1 once, then wait for a strictly newer prediction.
 
     Finish the selected prefix before selecting the latest available chunk.
-    Waiting never replays an action or consumes indices 2..9. This limits delta
+    Waiting never replays an action or consumes later indices. This limits delta
     accumulation rate; it does not reset accumulated targets to measured pose.
+    An action whose observation is too old is dropped with the rest of its
+    prefix (recorded in `skipped`), never executed.
     """
-    def __init__(self):
+    def __init__(self, steps=STEPS_PER_INFERENCE):
+        self.steps = steps
         self.packet = None
         self.index = 0
+        self.skipped = []
 
     def next_action(self, latest, now):
-        if self.packet is None or self.index >= STEPS_PER_INFERENCE:
+        if self.packet is None or self.index >= self.steps:
             if latest is None or (self.packet is not None and latest[0] <= self.packet[0]):
                 return None
             actions = np.asarray(latest[4])
-            if actions.ndim != 2 or actions.shape[0] < STEPS_PER_INFERENCE or actions.shape[1] != 7:
-                raise old.SafetyError("policy chunk must contain at least two 7D actions")
+            if actions.ndim != 2 or actions.shape[0] < self.steps or actions.shape[1] != 7:
+                raise old.SafetyError("policy chunk must contain at least {} 7D actions".format(self.steps))
             self.packet, self.index = latest, 0
-        if not 0 <= now - self.packet[1] <= .4:
-            raise old.SafetyError("selected policy observation is stale or future-dated")
+        age = now - self.packet[1]
+        if not age >= 0:
+            raise old.SafetyError("selected policy observation is future-dated")
+        lateness = age - self.index / old.ACTION_HZ
+        if lateness > MAX_ACTION_LATENESS_S:
+            self.skipped.append(dict(sequence=self.packet[0], index=self.index, age_ms=1000 * age,
+                                     lateness_ms=1000 * lateness))
+            self.index = self.steps
+            return None
         sequence, observed_at, _, _, actions = self.packet
         index = self.index
         self.index += 1
@@ -232,6 +271,17 @@ def run(args):
     worker = None
     targets = []
     waiting_ticks = 0
+    chunks = PrefixChunks(args.actions_per_inference)
+    per_request_seed = args.noise_seed == "per-request"
+    model_id = "pi05_pnp7_40merged_step{}{}".format(args.policy_step, "_seedexp" if per_request_seed else "")
+    policy_port = POLICY_SERVERS[(args.policy_step, per_request_seed)]
+    # A fresh, logged base per run; inference k uses base + k.
+    noise_seed_base = time.time_ns() % 2**31 if per_request_seed else None
+    governor = TrackingGovernor()
+    governor_samples = []
+    guarded = args.client_tracking_stop == "on"
+    monitor = TrackingMonitor()
+    tracking_samples = []
     error_message = None
     motion_elapsed_s = None
     output = Path(args.log)
@@ -253,19 +303,50 @@ def run(args):
 
     def inference():
         p, rotation, state, images, ages = observe()
+        seed = None if noise_seed_base is None else (noise_seed_base + len(rows)) % 2**31
         before = time.monotonic()
-        actions, inference_ms = conn.infer(state, *images, old.PROMPT)
+        actions, inference_ms = conn.infer(state, *images, old.PROMPT, seed=seed)
         elapsed = time.monotonic() - before
         if elapsed > .8:
             raise old.SafetyError("inference round trip exceeds 800 ms")
         for action in actions:
             limits.action(action)
         entry = dict(position=p.tolist(), state=state.tolist(), actions=actions.tolist(),
-                     inference_ms=inference_ms, round_trip_ms=elapsed * 1000, **ages)
+                     inference_ms=inference_ms, round_trip_ms=elapsed * 1000, noise_seed=seed, **ages)
         rows.append(entry)
         print("INFERENCE sample={} round_trip_ms={:.1f} first={}".format(
             len(rows), elapsed * 1000, np.round(actions[0], 6).tolist()), flush=True)
         return p, rotation, actions
+
+    def govern(p, rotation, measured, measured_r, action):
+        p, rotation, applied, info = governor.step(
+            p, rotation, measured, measured_r, action, time.monotonic())
+        governor_samples.append(dict(elapsed_s=time.monotonic() - started, **info))
+        if info["state"] == "paused":
+            # Do not advance gripper state while the arm cannot advance.
+            gripper.emergency_stop()
+        previous = governor_samples[-2]["state"] if len(governor_samples) > 1 else "normal"
+        if info["state"] != previous:
+            print("TRACKING_GOVERNOR state={} scale={:.3f} error_mm={:.2f} error_rad={:.4f}".format(
+                info["state"], info["scale"], 1000 * info["position_error_m"], info["rotation_error_rad"]), flush=True)
+        return p, rotation, applied
+
+    def unguarded(p, rotation, measured, measured_r, action):
+        # Diagnostic mode: unscaled policy deltas, leashed to the measured pose so
+        # the target cannot wind up ahead of a slower arm; errors never stop.
+        dropped_m = dropped_rad = 0.0
+        if action is not None:
+            p, rotation = apply_action(p, rotation, action)
+            p, rotation, dropped_m, dropped_rad = cap_lead(
+                p, rotation, measured, measured_r, args.target_lead_cap_mm / 1000, args.target_lead_cap_rad)
+        info, changed = monitor.step(p, rotation, measured, measured_r)
+        tracking_samples.append(dict(elapsed_s=time.monotonic() - started, has_action=action is not None,
+                                     dropped_translation_m=dropped_m, dropped_rotation_rad=dropped_rad, **info))
+        if changed:
+            print("TRACKING_UNGUARDED level={} error_mm={:.2f} error_rad={:.4f} controller_ignores_target={}".format(
+                info["level"], 1000 * info["position_error_m"], info["rotation_error_rad"],
+                str(info["level"] == 2).lower()), flush=True)
+        return p, rotation, action
 
     try:
         gripper = start_observation_devices(cameras, args.gripper_port)
@@ -280,12 +361,14 @@ def run(args):
                 if time.monotonic() > deadline:
                     raise old.SafetyError("observation preflight failed: {}".format(exc)) from exc
                 time.sleep(.05)
-        conn = old.PolicyConnection(args.server, 5559, "pnp7-local-demo", 2.0)
+        conn = old.PolicyConnection(args.server, policy_port, "pnp7-local-demo", 2.0)
         health = conn.health()
-        if health.get("model") != MODEL_ID or not health.get("strict_checkpoint"):
-            raise old.SafetyError("wrong checkpoint: {}".format(health))
+        if (health.get("model") != model_id or not health.get("strict_checkpoint") or
+                bool(health.get("per_request_seed")) != per_request_seed):
+            raise old.SafetyError("wrong checkpoint or seed mode: {}".format(health))
         inference()
-        print("PREFLIGHT_PASS mode={} model={}".format(args.mode, MODEL_ID), flush=True)
+        print("PREFLIGHT_PASS mode={} model={} port={} noise_seed={} noise_seed_base={}".format(
+            args.mode, model_id, policy_port, args.noise_seed, noise_seed_base), flush=True)
         if args.mode == "shadow":
             started = time.monotonic()
             while time.monotonic() - started < args.duration:
@@ -304,8 +387,15 @@ def run(args):
         deadman.arm()
         conn.close()
         conn = None
-        print("LIVE_READY hold_F3=true release_ends_run=true duration={} profile={} async={} actions_per_inference={}".format(
-            args.duration, args.profile, args.profile == "full", STEPS_PER_INFERENCE), flush=True)
+        print("LIVE_READY hold_F3=true release_ends_run=true client_tracking_stop={} tracking_governor={} target_lead_cap_mm={} target_lead_cap_rad={} duration={} profile={} async={} actions_per_inference={} max_action_lateness_ms={:.0f} max_policy_silence_ms={:.0f} gripper_vote={}".format(
+            args.client_tracking_stop, "two_stage" if guarded else "bypassed",
+            args.target_lead_cap_mm, args.target_lead_cap_rad,
+            args.duration, args.profile, args.profile == "full", args.actions_per_inference,
+            1000 * MAX_ACTION_LATENESS_S, 1000 * MAX_POLICY_SILENCE_S, args.gripper_vote), flush=True)
+        if not guarded:
+            print("CLIENT_TRACKING_STOP_OFF unscaled policy deltas leashed to {} mm / {} rad of measured pose, "
+                  "excess dropped; SERL watchdog, workspace and pedal remain; physical stop is the tracking "
+                  "safeguard".format(args.target_lead_cap_mm, args.target_lead_cap_rad), flush=True)
         if not deadman.wait_for_press(args.arm_timeout):
             raise old.SafetyError("pedal arm timeout")
         if not deadman.enabled():
@@ -315,8 +405,8 @@ def run(args):
                           stop_controllers=[], strictness=2, start_asap=True, timeout=1.0)
         if not response.ok:
             raise old.SafetyError("could not start impedance controller")
-        conn = old.PolicyConnection(args.server, 5559, "pnp7-local-demo", 2.0)
-        if conn.health().get("model") != MODEL_ID:
+        conn = old.PolicyConnection(args.server, policy_port, "pnp7-local-demo", 2.0)
+        if conn.health().get("model") != model_id:
             raise old.SafetyError("checkpoint changed while arming")
         gripper.enable_motion(deadman.enabled)
         initial_p, initial_r, _, _, _ = observe()
@@ -327,7 +417,6 @@ def run(args):
             worker = AsyncPolicy(inference)
             worker.start()
             p, rotation = initial_p.copy(), initial_r.copy()
-            chunks = TwoStepChunks()
             next_tick = time.monotonic()
             while time.monotonic() - started < args.duration and deadman.enabled():
                 packet = worker.latest()
@@ -339,28 +428,42 @@ def run(args):
                     continue
                 measured, measured_r, _, _, _ = observe()
                 limits.position(measured)
+                skipped = len(chunks.skipped)
                 selected = chunks.next_action(packet, time.monotonic())
+                if len(chunks.skipped) > skipped:
+                    print("STALE_ACTION_SKIPPED sequence={sequence} index={index} age_ms={age_ms:.0f} lateness_ms={lateness_ms:.0f}".format(
+                        **chunks.skipped[-1]), flush=True)
                 if selected is not None:
                     sequence, index, raw, observed_at = selected
                     action = limits.action(raw)
-                    p = p + action[:3]
-                    rotation = rotation @ old.rpy_to_rotation(action[3:6])
                 else:
                     # No repeated target publications or gripper updates while
                     # waiting. Existing robot/gripper watchdogs stay effective.
                     waiting_ticks += 1
+                    action = None
+                p, rotation, applied = (govern if guarded else unguarded)(
+                    p, rotation, measured, measured_r, action)
                 limits.position(p)
                 # The absolute demonstrated workspace replaces the 5 cm smoke
-                # envelope; tracking-error and orientation guards remain.
+                # envelope; the orientation guard remains, tracking guard unless off.
                 if old.rotation_angle(initial_r.T @ rotation) > 1.5:
                     raise old.SafetyError("full-run rotation limit")
-                check_tracking(p, rotation, measured, measured_r)
-                if selected is not None and controller.publish_policy_target(p, rotation, action[6]):
-                    commands += 1
-                    targets.append(dict(elapsed_s=time.monotonic() - started,
-                                        sequence=sequence, index=index, action=action.tolist(),
-                                        observation_age_ms=1000 * (time.monotonic() - observed_at),
-                                        target_position=p.tolist(), measured_position=measured.tolist()))
+                if guarded:
+                    check_tracking(p, rotation, measured, measured_r)
+                if applied is not None:
+                    if args.gripper_vote == "action":
+                        grip, source = float(applied[6]), None
+                    else:
+                        # One debounced vote per chunk (see gripper_vote_value).
+                        grip, source = gripper_vote_value(chunks.packet[4], args.gripper_vote), sequence
+                    if controller.publish_policy_target(p, rotation, grip, source):
+                        commands += 1
+                        targets.append(dict(elapsed_s=time.monotonic() - started,
+                                            sequence=sequence, index=index, action=applied.tolist(),
+                                            policy_action=action.tolist(), gripper_command=grip,
+                                            governor_scale=governor.scale if guarded else None,
+                                            observation_age_ms=1000 * (time.monotonic() - observed_at),
+                                            target_position=p.tolist(), measured_position=measured.tolist()))
                 next_tick += 1 / 30
                 delay = next_tick - time.monotonic()
                 if delay < -.05:
@@ -377,15 +480,14 @@ def run(args):
                 measured, measured_r, _, _, _ = observe()
                 limits.position(measured)
                 action = limits.action(raw)
-                p = p + action[:3]
-                rotation = rotation @ old.rpy_to_rotation(action[3:6])
+                p, rotation, applied = govern(p, rotation, measured, measured_r, action)
                 limits.position(p)
                 if np.linalg.norm(p - initial_p) > .05 or np.linalg.norm(measured - initial_p) > .055:
                     raise old.SafetyError("session translation limit")
                 if old.rotation_angle(initial_r.T @ rotation) > .15:
                     raise old.SafetyError("session rotation limit")
                 check_tracking(p, rotation, measured, measured_r)
-                if controller.publish_policy_target(p, rotation, action[6]):
+                if applied is not None and controller.publish_policy_target(p, rotation, applied[6]):
                     commands += 1
                 time.sleep(1 / 30)
         if deadman.stopped():
@@ -434,7 +536,17 @@ def run(args):
                       error=error_message, active_duration_s=motion_elapsed_s,
                       home=home_report, tracking_position_limit_m=TRACKING_POSITION_LIMIT,
                       tracking_rotation_limit_rad=TRACKING_ROTATION_LIMIT,
-                      actions_per_inference=STEPS_PER_INFERENCE, waiting_ticks=waiting_ticks)
+                      actions_per_inference=args.actions_per_inference, waiting_ticks=waiting_ticks,
+                      client_tracking_stop=args.client_tracking_stop, tracking_samples=tracking_samples,
+                      target_lead_cap_mm=args.target_lead_cap_mm, target_lead_cap_rad=args.target_lead_cap_rad,
+                      noise_seed=args.noise_seed, noise_seed_base=noise_seed_base,
+                      max_action_lateness_s=MAX_ACTION_LATENESS_S,
+                      max_policy_silence_s=MAX_POLICY_SILENCE_S, skipped_stale_actions=chunks.skipped,
+                      gripper_vote=args.gripper_vote,
+                      gripper_switches=[] if gripper is None or started is None else
+                      [dict(elapsed_s=t - started, target=target) for t, target in gripper.switches],
+                      tracking_governor=governor.settings, governor_samples=governor_samples,
+                      governor_last=governor.last_info)
         output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
         if first_images:
             for role, image in zip(("external", "wrist"), first_images):
@@ -450,6 +562,18 @@ def parse_args():
     parser.add_argument("--mode", choices=("shadow", "live"), default="shadow")
     parser.add_argument("--profile", choices=("smoke", "full"), default="smoke")
     parser.add_argument("--server", default="100.71.83.59")
+    parser.add_argument("--policy-step", type=int, choices=sorted({step for step, _ in POLICY_SERVERS}), default=7500,
+                        help="40merged checkpoint; selects the robot-s1 server port, verified by model id")
+    parser.add_argument("--noise-seed", choices=("fixed", "per-request"), default="fixed",
+                        help="fixed: deployed servers (seed 0 every inference); per-request: a new logged "
+                             "seed per inference via the seedexp server")
+    parser.add_argument("--actions-per-inference", type=int, choices=range(2, 11), default=STEPS_PER_INFERENCE,
+                        help="full profile: leading actions executed from each fresh chunk (2-10); action k runs "
+                             "at most 400 ms after its intended time, observation + k/30 s")
+    parser.add_argument("--gripper-vote", choices=("tail", "chunk", "action"), default="tail",
+                        help="full profile: one debounced vote per policy chunk, two consecutive chunks to switch; "
+                             "tail = mean of its last {} predicted steps, chunk = whole-horizon mean; "
+                             "action = legacy per-action votes".format(GRIPPER_TAIL_STEPS))
     parser.add_argument("--duration", type=float, default=5)
     parser.add_argument("--arm-timeout", type=float, default=120)
     parser.add_argument("--deadman", default="/dev/foot_brake")
@@ -457,10 +581,34 @@ def parse_args():
     parser.add_argument("--norm-stats", default=str(Path(__file__).parent / "ros/norm_stats_40merged.json"))
     parser.add_argument("--log", required=True)
     parser.add_argument("--home-config", default=str(Path(__file__).resolve().parents[1] / "conf/full100b.conf"))
+    parser.add_argument("--client-tracking-stop", choices=("on", "off"), default="on",
+                        help="off (full profile, supervised diagnostics only): no governor or client "
+                             "tracking-error stop; unscaled deltas on a lead leash; errors logged, crossings printed")
+    parser.add_argument("--target-lead-cap-mm", type=float,
+                        help="with --client-tracking-stop off: max target lead ahead of the measured position "
+                             "(default 20); excess policy motion is dropped")
+    parser.add_argument("--target-lead-cap-rad", type=float,
+                        help="with --client-tracking-stop off: max target rotation lead (default 0.10)")
     args = parser.parse_args()
-    maximum = 40 if args.profile == "full" else 10
+    maximum = 90 if args.profile == "full" else 10
     if not 0 < args.duration <= maximum:
         parser.error("duration exceeds selected profile limit: {} seconds".format(maximum))
+    if args.actions_per_inference != STEPS_PER_INFERENCE and args.profile != "full":
+        parser.error("--actions-per-inference is only available for the full profile")
+    if args.client_tracking_stop == "off" and args.profile != "full":
+        parser.error("--client-tracking-stop off is only available for the full profile")
+    if args.client_tracking_stop == "on":
+        if (args.target_lead_cap_mm, args.target_lead_cap_rad) != (None, None):
+            parser.error("target lead caps apply only with --client-tracking-stop off")
+    else:
+        if args.target_lead_cap_mm is None:
+            args.target_lead_cap_mm = 20.0
+        if args.target_lead_cap_rad is None:
+            args.target_lead_cap_rad = .10
+        if not (0 < args.target_lead_cap_mm <= 45 and 0 < args.target_lead_cap_rad <= .30):
+            parser.error("target lead caps must be within (0, 45] mm and (0, 0.30] rad")
+    if (args.policy_step, args.noise_seed == "per-request") not in POLICY_SERVERS:
+        parser.error("no server for --policy-step {} with --noise-seed {}".format(args.policy_step, args.noise_seed))
     return args
 
 
