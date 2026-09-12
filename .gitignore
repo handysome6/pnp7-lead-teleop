@@ -25,9 +25,25 @@ __pycache__/
 *.bad_*
 conf-bak-*/
 
-# Screenshots and generated figures. Debugging leftovers and script output,
-# regenerable, and one of them is 2.1 MB.
+# Screenshots, extracted dataset frames and generated figures. Debugging
+# leftovers and script output, regenerable, and one of them is 2.1 MB. No image
+# is tracked, so these patterns shadow nothing.
 *.png
+*.jpg
+
+# Analysis output. 165 MB, mostly copies of 1 kHz episode CSVs pulled off the
+# control PC for offline work, which the episodes themselves are already the
+# source of. The write-ups that are meant to last live in docs/ with their
+# evidence JSON beside them, the way the 2026-09-09 audit did it.
+artifacts/
+
+# Ad-hoc recordings made outside the GUI's episodes/ directory -- same kind of
+# data, same reason to keep it off the repo.
+test_jitter/
+
+# A staged copy of upstream RLinf, kept for reference while reworking the
+# executor. Vendored third-party source, like DynamixelSDK above.
+.codex_rlinf_stage/
 
 # Run artefacts written next to the code by default.
 /dry.csv

@@ -7,3 +7,7 @@ logs/
 .catkin_tools/
 build_latest.log
 .validate.lock
+
+# Validation run output: paired camera frames and their JSON, 47 MB. Produced by
+# a run, not an input to one.
+validation/

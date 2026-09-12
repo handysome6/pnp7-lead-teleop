@@ -1,0 +1,16 @@
+{
+  "run": "/home/liushuai/workspace/pnp7-lead-teleop/inference/ros/validation/live_full_20260912_014036_2038713.json",
+  "duration_s": 29.73756407899782,
+  "result": "deadman_released",
+  "actions_per_inference": 10,
+  "seed_mode": "per-request",
+  "gripper_vote": "tail",
+  "commands": 886,
+  "selected_chunks": 89,
+  "inferences": 173,
+  "median_round_trip_ms": 174.9466269975528,
+  "median_observation_age_ms": 411.05847949074814,
+  "translation_clipped_ticks": 206,
+  "sum_clipped_translation_norm_mm": 293.00148587106537,
+  "inference_seed_unique": 173
+}

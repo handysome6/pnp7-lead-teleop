@@ -1,0 +1,62 @@
+[
+  {
+    "host": "robot-s0",
+    "remote": "/home/liushuai/workspace/pnp7-lead-teleop/inference/robot_s0_policy.py",
+    "local": "client.py",
+    "sha256": "4956739f9a6a75c8b5b3ac68742a676348cb0d5d214f4c1529ba9128138357c2"
+  },
+  {
+    "host": "robot-s0",
+    "remote": "/home/liushuai/workspace/pnp7-lead-teleop/src/pnp7_teleop.cpp",
+    "local": "teleop.cpp",
+    "sha256": "9987a858f7e2893c5e77635be0c85021d48112eb04d58c937864621b42413c6a"
+  },
+  {
+    "host": "robot-s0",
+    "remote": "/home/liushuai/workspace/pnp7-lead-teleop/inference/ros/robot_s0_impedance.yaml",
+    "local": "impedance.yaml",
+    "sha256": "2c85a5f2cb8f1e7f3e9a56c8466df9ce762640d407ec699d4b6ad552c02ecbde"
+  },
+  {
+    "host": "robot-s0",
+    "remote": "/home/liushuai/workspace/pnp7-lead-teleop/inference/ros/validation/live_full_20260912_020047_13656.json",
+    "local": "last_run.json",
+    "sha256": "23a6b694bc99cd6983d625fdc8352e2488f07c81dd4733487f0ddefeb7a65872"
+  },
+  {
+    "host": "robot-s1",
+    "remote": "/home/andyls/vla/pnp7/seed_exp_20260911/serve_pi05_seed.py",
+    "local": "serve_pi05_seed.py",
+    "sha256": "8e13059ac23d03bcf6400f6b6474ea989b08f0747fe84b8c903152a4f45a610a"
+  },
+  {
+    "host": "robot-s1",
+    "remote": "/home/andyls/vla/RLinf/rlinf/models/embodiment/openpi/openpi_action_model.py",
+    "local": "action_model.py",
+    "sha256": "6545ec3f0837f8cfc22cfdbfd2bf18889b87d43098612857500806e376f16fae"
+  },
+  {
+    "host": "robot-s1",
+    "remote": "/home/andyls/vla/pnp7/runs/20260910_40merged/convert_to_lerobot_robot_s0_20260910.py",
+    "local": "deployed_converter.py",
+    "sha256": "8f7bd81e763ffa6a3cac4c873018abd1b6a62873c3dd7392e037770bebbd9d1c"
+  },
+  {
+    "host": "robot-s1",
+    "remote": "/home/andyls/vla/pnp7/runs/20260910_40merged/pnp7_sft_pi05_40merged_20260910.yaml",
+    "local": "training.yaml",
+    "sha256": "e485cc519d835868e5efbb148361074adba22306d24a4f4fd6fec2b98a0de870"
+  },
+  {
+    "host": "robot-s0",
+    "remote": "/home/liushuai/workspace/pnp7-lead-teleop/inference/ros/src/serl_franka_controllers/src/cartesian_impedance_controller.cpp",
+    "local": "serl_controller.cpp",
+    "sha256": "1947aba6a7ddd08e8971ab53e8a9320a991ff2cfe4e8bba14d407c31c5711f6f"
+  },
+  {
+    "host": "robot-s0",
+    "remote": "/home/liushuai/workspace/pnp7-lead-teleop/inference/ros/validation/live_full_20260912_014036_2038713.json",
+    "local": "ten_step_run.json",
+    "sha256": "6d71a6a18a1ff6e06108d19da82f27a11056f14b7fff8eefe0424392f2fa2791"
+  }
+]
