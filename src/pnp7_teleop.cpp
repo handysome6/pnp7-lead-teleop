@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <iomanip>
@@ -1007,6 +1008,23 @@ class SafetyChain {
     return target_;
   }
 
+  // A host stall leaves the robot extrapolating -- FCI assumes constant
+  // acceleration through a lost packet -- while this generator's own notion of
+  // where it left the arm stands still. Resuming from that stale value is what
+  // reaches the motion generator as a discontinuity. Adopt the setpoint and
+  // velocity the robot actually reached instead.
+  //
+  // `filtered_` is deliberately left alone: it tracks where the operator's hand
+  // has asked the arm to be, and a stall on this side did not move their hand.
+  // The rate limiter then closes the gap between the two under its own bounds,
+  // which is the same path any other tracking error takes.
+  void resync(const std::array<double, kNumJoints>& q_d,
+              const std::array<double, kNumJoints>& dq_d) {
+    prev_target_ = q_d;
+    prev_velocity_ = dq_d;
+    target_ = q_d;
+  }
+
   const std::array<double, kNumJoints>& target() const { return target_; }
 
   // libfranka rejects a motion that finishes while still moving, so a session
@@ -1219,32 +1237,90 @@ class MotionFinishGuard {
 
 // A delayed callback can still carry a 1 ms robot period: the stale state is
 // delivered first, followed by a 5 ms jump (observed in ep027 and ep028).
-// Check host time as well as robot time before sending another command. Throwing
-// exits via libfranka's cancelMotion/StopMove path; it never clears robot faults.
+// Check host time as well as robot time before sending another command.
+//
+// A stall is not automatically a robot fault, though, and it used to be treated
+// as one. libfranka's own rate_limiting.h says "when a packet is lost, FCI
+// assumes a constant acceleration model", and exposes kTolNumberPacketsLost for
+// setups that do lose packets -- loss is an anticipated, tunable condition
+// rather than a fatal one. A 6.44 ms gap on 2026-09-12 cost a whole take while
+// the robot itself never complained: no franka error, no fault onset, just this
+// guard throwing first.
+//
+// The real hazard is narrower than a missed deadline. SafetyChain always steps
+// from its own last output under bounded velocity and acceleration, so the
+// command stream is continuous by construction; what diverges is where the robot
+// extrapolated to while nothing was being sent. The caller repairs that by
+// adopting q_d/dq_d before stepping again, so a stall reports kStalled and the
+// session continues. Abort only where the evidence says the link itself is
+// failing: a gap far past anything extrapolation covers, or the robot's own
+// success rate falling. Throwing exits via libfranka's cancelMotion/StopMove
+// path; it never clears robot faults.
 class ControlDeadlineGuard {
  public:
-  void enter(int64_t now, double robot_period_s, uint64_t robot_time_ms) {
-    const int64_t gap = last_entry_ ? now - last_entry_ : 0;
+  enum class Verdict { kOk, kStalled };
+
+  Verdict enter(int64_t now, double robot_period_s, uint64_t robot_time_ms,
+                double success_rate) {
+    // An explicit flag rather than a zero sentinel on last_entry_: a timestamp
+    // that happened to be zero would otherwise disable the guard for good.
+    const int64_t gap = have_last_ ? now - last_entry_ : 0;
     last_entry_ = now;
-    if (gap > 3000000 || robot_period_s > 0.003) {
+    have_last_ = true;
+    ++cycles_;
+    if (gap <= kStallNs && robot_period_s <= kStallPeriodS) return Verdict::kOk;
+    ++stalls_;
+    if (gap > worst_gap_ns_) worst_gap_ns_ = gap;
+    // control_command_success_rate reads zero until a control loop has been
+    // running, and covers the last 100 commands, so it means nothing until a
+    // full window has gone by. One 6 ms gap costs about 0.06 of it.
+    const bool rate_meaningful = cycles_ > 200;
+    if (gap > kAbortNs || robot_period_s > kAbortPeriodS ||
+        (rate_meaningful && success_rate < kMinSuccessRate)) {
       std::ostringstream detail;
       detail << "FCI timing guard: host_gap_ms=" << gap / 1e6
              << " robot_period_ms=" << robot_period_s * 1000.0
              << " robot_time_ms=" << robot_time_ms
-             << " -- stale joint command cancelled";
+             << " success_rate=" << success_rate << " stalls=" << stalls_
+             << " -- link not keeping up, joint command cancelled";
       throw std::runtime_error(detail.str());
     }
+    return Verdict::kStalled;
   }
-  void commandReady(int64_t now) const {
-    if (now - last_entry_ > 1000000) {
+
+  // Time spent inside the callback itself. The budget is the 1 ms period, but
+  // overrunning it is not by itself a reason to end the session: the command
+  // still goes out, and the next enter() sees the gap and resynchronises. Only
+  // an overrun far past the period says the callback is not viable.
+  void commandReady(int64_t now) {
+    const int64_t work = now - last_entry_;
+    if (work > worst_work_ns_) worst_work_ns_ = work;
+    if (work > kAbortWorkNs) {
       std::ostringstream detail;
-      detail << "FCI timing guard: callback_work_ms=" << (now - last_entry_) / 1e6
+      detail << "FCI timing guard: callback_work_ms=" << work / 1e6
              << " -- late joint command cancelled";
       throw std::runtime_error(detail.str());
     }
   }
+
+  int64_t stalls() const { return stalls_; }
+  double worstGapMs() const { return worst_gap_ns_ / 1e6; }
+  double worstWorkMs() const { return worst_work_ns_ / 1e6; }
+
  private:
+  static constexpr int64_t kStallNs = 3000000;      // 3 ms: resynchronise
+  static constexpr int64_t kAbortNs = 50000000;     // 50 ms: give up
+  static constexpr int64_t kAbortWorkNs = 5000000;  // 5 ms inside the callback
+  static constexpr double kStallPeriodS = 0.003;
+  static constexpr double kAbortPeriodS = 0.050;
+  static constexpr double kMinSuccessRate = 0.90;
+
+  bool have_last_{false};
   int64_t last_entry_{0};
+  int64_t cycles_{0};
+  int64_t stalls_{0};
+  int64_t worst_gap_ns_{0};
+  int64_t worst_work_ns_{0};
 };
 
 // ------------------------------------------------------------- gripper ----
@@ -1731,6 +1807,84 @@ int runSelfTest(const Config& config) {
                 "notch passes a constant offset unchanged");
   }
 
+  // Timing guard: an isolated stall is recoverable, a failing link is not.
+  {
+    auto threw = [](const std::function<void()>& fn) {
+      try { fn(); } catch (const std::runtime_error&) { return true; }
+      return false;
+    };
+    using Verdict = ControlDeadlineGuard::Verdict;
+    const int64_t ms = 1000000;
+
+    ControlDeadlineGuard g;
+    int64_t now = 1000 * ms;
+    requireTest(g.enter(now, 0.001, 0, 1.0) == Verdict::kOk, "first cycle is ok");
+    now += ms;
+    requireTest(g.enter(now, 0.001, 1, 1.0) == Verdict::kOk, "1 ms cadence is ok");
+    requireTest(g.stalls() == 0, "no stall counted on a healthy cadence");
+    // The 6.44 ms gap that used to end a session.
+    now += 6 * ms + ms / 2;
+    requireTest(g.enter(now, 0.001, 2, 1.0) == Verdict::kStalled,
+                "an isolated 6 ms gap is recoverable, not fatal");
+    requireTest(g.stalls() == 1 && g.worstGapMs() > 6.0, "stall counted");
+
+    // A gap far past what constant-acceleration extrapolation covers.
+    ControlDeadlineGuard g2;
+    int64_t n2 = 0;
+    g2.enter(n2, 0.001, 0, 1.0);
+    n2 += 100 * ms;
+    requireTest(threw([&] { g2.enter(n2, 0.001, 1, 1.0); }),
+                "a 100 ms gap still aborts");
+
+    // A success rate this low means the link, not one hiccup -- but only once a
+    // full window of cycles has gone by.
+    ControlDeadlineGuard g3;
+    int64_t n3 = 0;
+    for (int k = 0; k < 300; ++k) { n3 += ms; g3.enter(n3, 0.001, k, 1.0); }
+    n3 += 6 * ms;
+    requireTest(threw([&] { g3.enter(n3, 0.001, 301, 0.5); }),
+                "a falling success rate aborts");
+    ControlDeadlineGuard g4;
+    int64_t n4 = 0;
+    g4.enter(n4, 0.001, 0, 0.0);
+    n4 += 6 * ms;
+    requireTest(g4.enter(n4, 0.001, 1, 0.0) == Verdict::kStalled,
+                "success rate is ignored before it means anything");
+
+    // Callback work: over the 1 ms budget is survivable, far over is not.
+    ControlDeadlineGuard g5;
+    int64_t n5 = 0;
+    g5.enter(n5, 0.001, 0, 1.0);
+    g5.commandReady(n5 + 2 * ms);
+    requireTest(g5.worstWorkMs() > 1.9, "callback work recorded");
+    requireTest(threw([&] { g5.commandReady(n5 + 10 * ms); }),
+                "a 10 ms callback still aborts");
+  }
+
+  // Resync adopts the robot's own setpoint, so the command after a stall
+  // continues from where the arm actually is rather than from a stale target.
+  {
+    Config cr = c;
+    cr.scale.fill(1.0);
+    cr.sign.fill(1.0);
+    SafetyChain chain_r(cr);
+    chain_r.seed(q0);
+    for (int k = 0; k < 200; ++k) chain_r.step(q0, big, dt);
+    const auto stale = chain_r.target();
+    requireTest(std::fabs(stale[0] - q0[0]) > 1e-3, "generator had moved away");
+    std::array<double, kNumJoints> q_d = q0;
+    std::array<double, kNumJoints> dq_d{};
+    for (int i = 0; i < kNumJoints; ++i) q_d[i] = stale[i] + 0.02;
+    chain_r.resync(q_d, dq_d);
+    requireTest(chain_r.target() == q_d, "resync adopts the robot setpoint");
+    const auto after = chain_r.step(q0, big, dt);
+    for (int i = 0; i < kNumJoints; ++i) {
+      requireTest(std::fabs(after[i] - q_d[i]) <=
+                      cr.max_joint_velocity[i] * dt * 1.5,
+                  "first command after a resync is continuous with the robot");
+    }
+  }
+
   // Hysteresis deadband: single-count chatter must not propagate, but real
   // motion must still track continuously once it leaves the band.
   {
@@ -2055,7 +2209,11 @@ int runRobot(const Config& config, double duration_s,
     const double dt = period.toSec() > 0.0 ? period.toSec() : 0.001;
     elapsed += dt;
     const int64_t now = monotonicNs();
-    deadline_guard.enter(now, period.toSec(), robot_state.time.toMSec());
+    if (deadline_guard.enter(now, period.toSec(), robot_state.time.toMSec(),
+                             robot_state.control_command_success_rate) ==
+        ControlDeadlineGuard::Verdict::kStalled) {
+      chain.resync(robot_state.q_d, robot_state.dq_d);
+    }
 
     if (first) {
       // First command must be the measured pose, so control starts continuous.
@@ -2172,8 +2330,16 @@ int runRobot(const Config& config, double duration_s,
   writeLog(log_path, rows, count);
   if (gripper && !gripper->healthy())
     throw std::runtime_error("Robotiq 夹爪故障，遥操已停止：" + gripper->failure());
+  // Stalls no longer end the session, so they have to be reported or they would
+  // become invisible. A take with a non-zero count is still usable -- the arm
+  // was resynchronised to the robot's own setpoint each time -- but a count that
+  // climbs across sessions is the memlock limit or CPU contention asking to be
+  // fixed, not noise.
   std::cout << "teleop finished. lead read_failures=" << lead.readFailures()
-            << " rejected_jumps=" << lead.rejectedJumps() << "\n";
+            << " rejected_jumps=" << lead.rejectedJumps()
+            << " fci_stalls=" << deadline_guard.stalls()
+            << " worst_gap_ms=" << deadline_guard.worstGapMs()
+            << " worst_callback_ms=" << deadline_guard.worstWorkMs() << "\n";
   return 0;
 }
 
@@ -2319,7 +2485,15 @@ int runHome(const Config& config) {
   robot.control([&](const franka::RobotState& robot_state,
                     franka::Duration period) -> franka::JointPositions {
     const double dt = period.toSec();
-    deadline_guard.enter(monotonicNs(), dt, robot_state.time.toMSec());
+    // Home's generator is a scalar arc length, with no per-joint state to adopt
+    // the robot's setpoint into. So a stall ramps the move down rather than
+    // resynchronising -- an interrupted home is simply rerun, which is a much
+    // cheaper outcome than the exception this used to raise.
+    if (deadline_guard.enter(monotonicNs(), dt, robot_state.time.toMSec(),
+                             robot_state.control_command_success_rate) ==
+        ControlDeadlineGuard::Verdict::kStalled) {
+      stopping = true;
+    }
     if (g_interrupted.load() || robot_state.current_errors) stopping = true;
     if (stopping) rate = std::max(0.0, rate - dt / kStopS);
 

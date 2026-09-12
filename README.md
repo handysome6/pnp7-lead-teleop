@@ -479,6 +479,58 @@ rejects a motion that ends with non-zero velocity.
 Config values are validated against compiled ceilings and can only ever be more
 conservative than them.
 
+#### FCI timing stalls
+
+A host stall is not automatically a robot fault, and it used to be treated as
+one. The guard threw on any inter-callback gap over 3 ms, which on 2026-09-12
+cost a whole take to a single 6.44 ms hiccup while the robot itself never
+complained -- that session's `bridge.log` carries no `franka error:` and no
+fault onset, only the guard throwing first.
+
+libfranka's `rate_limiting.h` says "when a packet is lost, FCI assumes a
+constant acceleration model", and exposes `kTolNumberPacketsLost` with the note
+that it is zero only because an FR3 is not expected to lose packets, "if you
+encounter package loses with your setup you can increase this number". Loss is
+an anticipated condition, not a fatal one. (Note that `kTolNumberPacketsLost`
+being zero also means the SDK's own rate limiting assumes no loss, so it is
+weaker protection than it sounds.)
+
+The real hazard is narrower than a missed deadline. `SafetyChain` always steps
+from its own last output under bounded velocity and acceleration, so the command
+stream is continuous by construction; what diverges during a stall is where the
+robot extrapolated to while nothing was being sent. `SafetyChain::resync` adopts
+the robot's own `q_d`/`dq_d`, which removes exactly that divergence, and the
+session continues. `filtered_` is left alone -- it tracks where the operator's
+hand has asked the arm to be, and a stall on the host did not move their hand.
+
+So a gap over 3 ms resynchronises and is counted. The session is only abandoned
+where the evidence says the link itself is failing:
+
+| condition | threshold |
+|---|---|
+| inter-callback gap | resync over 3 ms, abort over 50 ms |
+| robot-reported period | resync over 3 ms, abort over 50 ms |
+| `control_command_success_rate` | abort under 0.90, once 200 cycles have gone by |
+| work inside the callback | abort over 5 ms |
+
+The success rate covers the last 100 commands and reads zero until a control
+loop is running, so it is ignored until a full window has passed; one 6 ms gap
+costs about 0.06 of it. Callback overrun past the 1 ms budget is recorded rather
+than fatal, because the command still goes out and the next cycle's gap check
+resynchronises anyway.
+
+Stalls no longer end a session, so `teleop finished.` reports them:
+
+    teleop finished. lead read_failures=0 rejected_jumps=0 fci_stalls=1
+    worst_gap_ms=6.43972 worst_callback_ms=0.31
+
+A take with a non-zero count is still usable. A count that climbs across
+sessions is the memlock limit below or CPU contention asking to be fixed.
+
+`home` has no per-joint state to resynchronise -- its generator is a scalar arc
+length -- so a stall there ramps the move down and reports `HOME_INTERRUPTED`,
+which is simply rerun.
+
 #### Realtime memory
 
 SCHED_FIFO 99 buys scheduling latency and nothing else. The memory subsystem can
