@@ -20,8 +20,11 @@
 
 #include <fcntl.h>
 #include <linux/input.h>
+#include <malloc.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -104,6 +107,104 @@ void requireRealtimeScheduling() {
   }
   std::cout << "FCI scheduling: SCHED_FIFO priority=" << param.sched_priority
             << " (kernel check bypassed)\n" << std::flush;
+}
+
+// SCHED_FIFO buys scheduling latency and nothing else. The memory subsystem can
+// still stall the control thread for milliseconds: a first touch of a lazily
+// mapped page, or a page the kernel reclaimed, blocks while the highest-priority
+// thread on the box simply waits. robot-s0 runs with swap enabled and GiB of it
+// already out, so this is not hypothetical -- it was seen as
+//
+//   FCI timing guard: host_gap_ms=6.43972 robot_period_ms=1
+//
+// which is the guard's signature for exactly this: the robot held its 1 ms
+// cadence and delivered every packet, the host was not running to receive them.
+//
+// Call AFTER the log buffer is allocated. MCL_CURRENT locks what is already
+// mapped, so allocating first gets the buffer locked either way; doing it the
+// other way round leaves MCL_FUTURE to police the allocation, and on a rig whose
+// memlock limit is smaller than the buffer that turns a long session into
+// std::bad_alloc instead of a session that merely runs unlocked.
+// Keep glibc from handing pages back to the kernel between allocations: every
+// page returned has to be faulted in again, and the second time may land in the
+// control loop. M_MMAP_MAX is deliberately left alone -- forcing the big log
+// buffer onto the brk heap measured 165 MB of address space against 99 MB with
+// it mmapped, and mlockall is charged for address space, not residency.
+void tuneAllocatorForRealtime() {
+  mallopt(M_TRIM_THRESHOLD, -1);
+}
+
+size_t mappedBytes() {
+  std::ifstream statm("/proc/self/statm");
+  size_t pages = 0;
+  if (!(statm >> pages)) return 0;
+  return pages * static_cast<size_t>(sysconf(_SC_PAGESIZE));
+}
+
+// SCHED_FIFO buys scheduling latency and nothing else. The memory subsystem can
+// still stall the control thread for milliseconds: a first touch of a lazily
+// mapped page, or a page the kernel reclaimed, blocks while the highest-priority
+// thread on the box simply waits. robot-s0 runs with swap enabled and GiB of it
+// already out, so this is not hypothetical -- it was seen as
+//
+//   FCI timing guard: host_gap_ms=6.43972 robot_period_ms=1
+//
+// which is the guard's signature for exactly this: the robot held its 1 ms
+// cadence and delivered every packet, the host was not running to receive them.
+//
+// Call BEFORE the log buffer is allocated and say how big it will be. Locking
+// first lets MCL_FUTURE cover the buffer as it is mapped; locking afterwards
+// would have to charge mlockall for the whole address space at once, which is a
+// larger number than the sum of its parts.
+//
+// The limit is checked rather than discovered, because discovering it is worse
+// in both directions: with MCL_FUTURE already set, an allocation that does not
+// fit fails as std::bad_alloc mid-startup, and refusing to start at all would
+// trade an occasional cancelled episode for no episodes. A rig whose memlock
+// limit is too small should be told so and then left running -- the FCI timing
+// guard still catches the stall safely, which is how it was found.
+void requireLockedMemory(size_t upcoming_bytes) {
+  rlimit limit{};
+  if (getrlimit(RLIMIT_MEMLOCK, &limit) != 0) limit.rlim_cur = 0;
+  // Every thread started after this reserves 8 MB of stack address space that
+  // MCL_FUTURE is then charged for, touched or not: the lead reader, the deadman
+  // reader, the status publisher, the gripper, and libfranka's own. Counting
+  // only what is mapped now measured 81 MB where the process went on to lock
+  // 100 MB, and a fit check that optimistic does not degrade gracefully -- it
+  // passes, and then a thread fails to start instead.
+  constexpr size_t kThreadStackAllowance = 6u * 8u * 1024u * 1024u;
+  const size_t needed = mappedBytes() + upcoming_bytes + kThreadStackAllowance;
+  const bool fits = limit.rlim_cur == RLIM_INFINITY ||
+                    needed <= static_cast<size_t>(limit.rlim_cur);
+  if (fits && mlockall(MCL_CURRENT | MCL_FUTURE) == 0) {
+    std::cout << "FCI memory: locked " << needed / (1024 * 1024) << " MB\n"
+              << std::flush;
+  } else {
+    std::cerr << "WARNING: control loop memory is not locked";
+    if (!fits) {
+      std::cerr << " (needs ~" << needed / (1024 * 1024) << " MB, `ulimit -l` "
+                << "allows " << static_cast<size_t>(limit.rlim_cur) / (1024 * 1024)
+                << " MB)";
+    } else {
+      std::cerr << " (mlockall: " << std::strerror(errno) << ")";
+    }
+    std::cerr << ".\n"
+              << "  Pages the kernel may reclaim show up mid-episode as the FCI "
+                 "timing guard cancelling a stale command.\n"
+              << "  Fix: give this user `memlock unlimited` in "
+                 "/etc/security/limits.conf, then start a fresh login session.\n"
+              << std::flush;
+    return;
+  }
+  // MCL_FUTURE locks pages as they are mapped, but the stack grows on demand:
+  // the page that faults mid-loop is one this thread has not touched yet. Touch
+  // it here, where stalling costs nothing -- one byte per page is enough. The
+  // empty asm takes the buffer as an input and clobbers memory, which is what
+  // stops the compiler discarding stores into an array nothing goes on to read.
+  constexpr size_t kStackPrefault = 256 * 1024;
+  unsigned char probe[kStackPrefault];
+  for (size_t i = 0; i < kStackPrefault; i += 4096) probe[i] = 0;
+  asm volatile("" : : "r"(probe) : "memory");
 }
 
 // std::thread inherits its creator's scheduler. USB reads, status-file writes
@@ -1740,6 +1841,13 @@ void printCommandShaping(const Config& config) {
 
 int runDry(const Config& config, double duration_s, const std::string& log_path) {
   printCommandShaping(config);
+  // Dry mode holds no FCI deadline, so it does not require SCHED_FIFO. It does
+  // lock memory, because a rehearsal that skips this is the one place a memlock
+  // limit too low for the configured duration would go unnoticed until it
+  // cancelled a real episode.
+  tuneAllocatorForRealtime();
+  const size_t dry_rows = static_cast<size_t>(duration_s * 1100) + 1000;
+  requireLockedMemory(dry_rows * sizeof(LogRow));
   LeadArmReader lead(config);
   lead.open();
   lead.assertTorqueDisabled();
@@ -1770,7 +1878,7 @@ int runDry(const Config& config, double duration_s, const std::string& log_path)
   LeadSnapshot origin{};
   std::array<double, kNumJoints> q_origin = q_robot;
 
-  std::vector<LogRow> rows(static_cast<size_t>(duration_s * 1100) + 1000);
+  std::vector<LogRow> rows(dry_rows);
   size_t count = 0;
 
   const int64_t watchdog_ns = static_cast<int64_t>(config.watchdog_ms) * 1000000LL;
@@ -1853,6 +1961,14 @@ int runDry(const Config& config, double duration_s, const std::string& log_path)
 
 int runRobot(const Config& config, double duration_s,
              const std::string& log_path) {
+  // Before anything else reserves address space. mlockall is charged for the
+  // whole of it, and every thread this function goes on to start reserves 8 MB
+  // of stack VMA whether or not it touches it -- locking after them measured
+  // 161 MB against 99 MB locking here, which is the difference between fitting
+  // under a 100 MB limit and not.
+  tuneAllocatorForRealtime();
+  const size_t log_rows = static_cast<size_t>(duration_s * 1100) + 2000;
+  requireLockedMemory(log_rows * sizeof(LogRow));
   LeadArmReader lead(config);
   lead.open();
   lead.assertTorqueDisabled();
@@ -1918,7 +2034,7 @@ int runRobot(const Config& config, double duration_s,
   LeadSnapshot origin{};
   std::array<double, kNumJoints> q_origin = before.q;
 
-  std::vector<LogRow> rows(static_cast<size_t>(duration_s * 1100) + 2000);
+  std::vector<LogRow> rows(log_rows);
   size_t count = 0;
 
   const int64_t watchdog_ns = static_cast<int64_t>(config.watchdog_ms) * 1000000LL;
@@ -2148,6 +2264,8 @@ int runHome(const Config& config) {
   // Match robot mode during the temporary robot-s0 non-RT trial.
   franka::Robot robot(config.robot_ip, franka::RealtimeConfig::kIgnore, kFrankaLogSize);
   requireRealtimeScheduling();
+  tuneAllocatorForRealtime();
+  requireLockedMemory(0);
   const franka::RobotState before = robot.readOnce();
   if (before.robot_mode != franka::RobotMode::kIdle) {
     throw std::runtime_error(

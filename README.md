@@ -479,6 +479,45 @@ rejects a motion that ends with non-zero velocity.
 Config values are validated against compiled ceilings and can only ever be more
 conservative than them.
 
+#### Realtime memory
+
+SCHED_FIFO 99 buys scheduling latency and nothing else. The memory subsystem can
+still stall the control thread for milliseconds -- a first touch of a lazily
+mapped page, or a page the kernel reclaimed -- and robot-s0 runs with swap
+enabled and GiB of it already out. That surfaced as
+
+    FCI timing guard: host_gap_ms=6.43972 robot_period_ms=1 -- stale joint
+    command cancelled
+
+with the robot holding a steady 1 ms period and `lead_seq` incrementing by one
+throughout: the arm was fine and delivered every packet, the host was not
+running to receive them.
+
+So `robot`, `home` and `dry` call `mlockall(MCL_CURRENT | MCL_FUTURE)` and
+pre-fault 256 kB of stack, before anything else reserves address space. Ordering
+matters twice over. mlockall is charged for address space rather than residency,
+and every thread started afterwards reserves 8 MB of stack VMA whether it
+touches it or not, so locking at the top of the function measured 99 MB where
+locking further down measured 161 MB. Locking before the log buffer is allocated
+also lets MCL_FUTURE cover the buffer as it is mapped, instead of charging for
+the whole address space at once.
+
+The limit is checked before locking rather than discovered by failing. With
+MCL_FUTURE already set, a buffer that does not fit fails as `std::bad_alloc`
+mid-startup; and refusing to start would trade an occasional cancelled episode
+for no episodes at all. A rig whose `memlock` limit is too small is told so and
+left running -- the timing guard still catches the stall safely, which is how it
+was found in the first place:
+
+    WARNING: control loop memory is not locked (needs ~129 MB, `ulimit -l`
+    allows 100 MB).
+
+A 60 s session needs roughly 130 MB including the thread-stack allowance, and
+the log buffer grows with duration, so the limit wants to be `unlimited` rather
+than a number. On robot-s0 that means a `memlock` line per user in
+`/etc/security/limits.d/`, matching the `rtprio` line already there, followed by
+a fresh login session -- `ulimit -l` confirms it took.
+
 Every run prints the shaping actually in force -- `command shaping:
 lowpass_hz=6 deadband=2 counts notch=4.8Hz Q=2` -- in `robot` and `dry` mode
 alike, so a recorded episode's `bridge.log` says what produced it. The CSV
